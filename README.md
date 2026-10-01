@@ -13,6 +13,7 @@ It does not edit Minecraft backend ban files or backend configuration.
 ## Features
 
 - Windows Firewall IP block and unblock
+- Linux iptables IP block and unblock
 - Local blacklist and whitelist database
 - AbuseIPDB checks
 - Password-protected web administration console
@@ -83,7 +84,8 @@ The Git checkout is kept there so the relay can be updated from Git later.
 - enables automatic certificate renewal
 - generates a salted scrypt password hash
 - stores the generated .env with mode 600
-- opens only TCP 80/443 in UFW for the public web console
+- installs iptables/iproute2 for Linux firewall enforcement
+- gives only the firewall network capability needed by the Minecraft-Guard service
 
 The public URL is:
 
@@ -106,8 +108,12 @@ Do not run git reset --hard if you keep local changes in the checkout.
 
 The setup script hashes the administrator password with Python's built-in scrypt implementation. The plaintext password is not written to .env; only the salted password hash is stored.
 
-### Important Linux limitation
+### Linux firewall enforcement
 
-The current IP blocking implementation in Minecraft-Guard.py was originally written around Windows PowerShell firewall commands. The Linux installer makes the web console public and secure, but it does not pretend those Windows firewall commands work on Linux.
+On Linux, Minecraft-Guard uses a dedicated iptables chain named `MINECRAFT_GUARD`. Blocked public IPv4 addresses are added to that chain with a DROP rule, while removing or whitelisting an address removes its Minecraft-Guard rule.
 
-A native Linux firewall backend can be added separately using nftables/UFW while keeping the web application unprivileged. The recommended architecture is a narrow privileged firewall helper rather than running the entire web console as root.
+The Python service is not run as root. The systemd unit grants it only `CAP_NET_ADMIN`, which is required to manage the iptables rules. The application also uses `ss` on Linux to discover active TCP connections.
+
+The database remains the policy source of truth. On startup, Minecraft-Guard rebuilds its dedicated chain from the saved blacklist instead of modifying Minecraft's `banned-ips.json` or other backend files.
+
+The installer does not use UFW for Minecraft-Guard's IP policy. It only configures nginx/HTTPS and the application service. Do not manually flush or repurpose the `MINECRAFT_GUARD` chain while Minecraft-Guard is running.
