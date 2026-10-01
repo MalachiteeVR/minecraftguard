@@ -13,22 +13,26 @@ from pathlib import Path
 import requests
 
 WORKDIR = Path(os.getenv("MINECRAFT_GUARD_WORKDIR", "/opt/minecraft-guard"))
+ENV_FILE = WORKDIR / ".env"
+
+def load_dotenv():
+    if not ENV_FILE.exists():
+        return
+    for raw in ENV_FILE.read_text(encoding="utf-8-sig").splitlines():
+        line = raw.strip()
+        if line and not line.startswith("#") and "=" in line:
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+load_dotenv()
+
+WORKDIR = Path(os.getenv("MINECRAFT_GUARD_WORKDIR", str(WORKDIR)))
 DB_FILE = WORKDIR / "blacklist.db"
 PORT = int(os.getenv("MINECRAFT_GUARD_PORT", "25565"))
-SYNC = int(os.getenv("MINECRAFT_GUARD_DB_SYNC_INTERVAL", "5"))
+SYNC = max(1, int(os.getenv("MINECRAFT_GUARD_DB_SYNC_INTERVAL", "5")))
 THRESHOLD = int(os.getenv("ABUSE_SCORE_THRESHOLD", "10"))
 DATACENTER = os.getenv("DATACENTER_USAGE_TYPE", "Data Center/Web Hosting/Transit")
 CHAIN = "MINECRAFT_GUARD"
-
-
-def load_dotenv():
-    env_file = WORKDIR / ".env"
-    if env_file.exists():
-        for raw in env_file.read_text(encoding="utf-8-sig").splitlines():
-            line = raw.strip()
-            if line and not line.startswith("#") and "=" in line:
-                key, value = line.split("=", 1)
-                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
 
 class GuardDB:
@@ -121,13 +125,12 @@ def valid_public_ipv4(ip):
         return False
 
 
-def iptables(args, check=False):
+def iptables(args):
     return subprocess.run(
         ["iptables", "-w", "5"] + args,
         capture_output=True,
         text=True,
         timeout=15,
-        check=check,
     )
 
 
@@ -136,12 +139,16 @@ def ensure_firewall_chain():
     if result.returncode != 0 and "Chain already exists" not in result.stderr:
         raise RuntimeError(f"Could not create {CHAIN}: {result.stderr.strip()}")
 
-    iptables(["-F", CHAIN])
+    flushed = iptables(["-F", CHAIN])
+    if flushed.returncode != 0:
+        raise RuntimeError(f"Could not flush {CHAIN}: {flushed.stderr.strip()}")
 
-    jump = ["-I", "INPUT", "1", "-p", "tcp", "--dport", str(PORT), "-j", CHAIN]
-    existing = iptables(["-C", "INPUT", "-p", "tcp", "--dport", str(PORT), "-j", CHAIN])
+    jump_args = ["-p", "tcp", "--dport", str(PORT), "-j", CHAIN]
+    existing = iptables(["-C", "INPUT"] + jump_args)
     if existing.returncode != 0:
-        iptables(jump)
+        inserted = iptables(["-I", "INPUT", "1"] + jump_args)
+        if inserted.returncode != 0:
+            raise RuntimeError(f"Could not insert INPUT jump: {inserted.stderr.strip()}")
 
     print(f"[FIREWALL] {CHAIN} active before other INPUT rules for TCP/{PORT}")
 
@@ -152,7 +159,11 @@ def current_firewall_ips():
         return set()
     found = set()
     for line in result.stdout.splitlines():
-        match = re.search(r"^-A\s+" + re.escape(CHAIN) + r"\s+-s\s+(\d+\.\d+\.\d+\.\d+)\s+-j\s+DROP$", line.strip())
+        match = re.search(
+            r"^-As+" + re.escape(CHAIN) +
+            r"s+-ss+(d+.d+.d+.d+)s+-js+DROP$",
+            line.strip(),
+        )
         if match:
             found.add(match.group(1))
     return found
@@ -172,13 +183,14 @@ def firewall_block(ip):
 
 
 def firewall_unblock(ip):
+    removed = False
     while True:
         result = iptables(["-D", CHAIN, "-s", ip, "-j", "DROP"])
         if result.returncode != 0:
             break
-    if result.returncode == 0 or "Bad rule" in result.stderr or "No chain/target" in result.stderr:
+        removed = True
+    if removed:
         print(f"[FIREWALL] Unblocked {ip}")
-        return True
     return True
 
 
@@ -196,15 +208,19 @@ def sync_firewall(db):
 def connected_client_ips():
     clients = set()
     try:
-        result = subprocess.run(["ss", "-Htn", "state", "established"],
-                                capture_output=True, text=True, timeout=10)
+        result = subprocess.run(
+            ["ss", "-Htn", "state", "established"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
         for line in result.stdout.splitlines():
             fields = line.split()
             if len(fields) < 4:
                 continue
             local = fields[2]
             remote = fields[3]
-            if not local.rsplit(":", 1)[-1] == str(PORT):
+            if local.rsplit(":", 1)[-1] != str(PORT):
                 continue
             remote_ip = remote.rsplit(":", 1)[0]
             if remote_ip.startswith("[") and remote_ip.endswith("]"):
@@ -226,6 +242,7 @@ def abuse_check(ip, api_key):
         )
         if response.status_code == 200:
             return response.json().get("data")
+        print(f"[WARN] AbuseIPDB returned HTTP {response.status_code} for {ip}")
     except requests.RequestException as exc:
         print(f"[WARN] AbuseIPDB check failed for {ip}: {exc}")
     return None
@@ -259,8 +276,6 @@ def process_client(ip, db, api_key):
 
 
 def main():
-    load_dotenv()
-
     if os.geteuid() != 0:
         sys.exit("[ERROR] minecraft-guard must run as root so it can manage iptables.")
 
@@ -281,24 +296,28 @@ def main():
         return
 
     if args.block:
-        db.remove_white(args.block)
-        db.add_block(args.block, notes="Manual CLI block", source="minecraft-guard/manual")
-        firewall_block(args.block)
+        ip = str(ipaddress.ip_address(args.block))
+        db.remove_white(ip)
+        db.add_block(ip, notes="Manual CLI block", source="minecraft-guard/manual")
+        firewall_block(ip)
         return
 
     if args.unblock:
-        db.remove_block(args.unblock)
-        firewall_unblock(args.unblock)
+        ip = str(ipaddress.ip_address(args.unblock))
+        db.remove_block(ip)
+        firewall_unblock(ip)
         return
 
     if args.whitelist_add:
-        db.add_white(args.whitelist_add)
-        db.remove_block(args.whitelist_add)
-        firewall_unblock(args.whitelist_add)
+        ip = str(ipaddress.ip_address(args.whitelist_add))
+        db.add_white(ip)
+        db.remove_block(ip)
+        firewall_unblock(ip)
         return
 
     if args.whitelist_remove:
-        db.remove_white(args.whitelist_remove)
+        ip = str(ipaddress.ip_address(args.whitelist_remove))
+        db.remove_white(ip)
         return
 
     ensure_firewall_chain()
@@ -313,11 +332,10 @@ def main():
     while True:
         try:
             sync_firewall(db)
-
             clients = connected_client_ips()
             for ip in clients - seen:
-                process_client(ip, db, api_key) if api_key else None
-
+                if api_key:
+                    process_client(ip, db, api_key)
             seen = clients
             time.sleep(SYNC)
         except KeyboardInterrupt:
