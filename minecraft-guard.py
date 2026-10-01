@@ -2,7 +2,6 @@
 import argparse
 import ipaddress
 import os
-import re
 import sqlite3
 import subprocess
 import sys
@@ -159,13 +158,14 @@ def current_firewall_ips():
         return set()
     found = set()
     for line in result.stdout.splitlines():
-        match = re.search(
-            r"^-As+" + re.escape(CHAIN) +
-            r"s+-ss+(d+.d+.d+.d+)s+-js+DROP$",
-            line.strip(),
-        )
-        if match:
-            found.add(match.group(1))
+        fields = line.split()
+        if len(fields) == 6 and fields[0] == "-A" and fields[1] == CHAIN and fields[2] == "-s" and fields[4] == "-j" and fields[5] == "DROP":
+            try:
+                addr = ipaddress.ip_address(fields[3])
+                if addr.version == 4:
+                    found.add(str(addr))
+            except ValueError:
+                pass
     return found
 
 
