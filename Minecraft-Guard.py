@@ -213,7 +213,7 @@ def netstat_ips():
     try:
         if LINUX:
             out = subprocess.run(["ss", "-tn"], capture_output=True, text=True, check=True).stdout
-            rx = re.compile(rf"^ESTAB\s+\d+\s+\d+\s+\S+:MINECRAFT_PORT\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+", re.MULTILINE)
+            rx = re.compile(rf"^ESTAB\s+\d+\s+\d+\s+\S+:{MINECRAFT_PORT}\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+", re.MULTILINE)
         else:
             out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, check=True).stdout
             rx = re.compile(rf"^\s*TCP\s+\S+:{MINECRAFT_PORT}\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+\s+ESTABLISHED", re.MULTILINE)
