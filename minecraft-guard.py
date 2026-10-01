@@ -275,6 +275,16 @@ def process_client(ip, db, api_key):
         print(f"[GUARD] Automatically blocked {ip}: {reason}")
 
 
+def validate_cli_ip(value):
+    try:
+        addr = ipaddress.ip_address(value)
+    except ValueError:
+        raise SystemExit("[ERROR] Invalid IP address.")
+    if addr.version != 4 or not addr.is_global:
+        raise SystemExit("[ERROR] Only public IPv4 addresses are supported.")
+    return str(addr)
+
+
 def main():
     if os.geteuid() != 0:
         sys.exit("[ERROR] minecraft-guard must run as root so it can manage iptables.")
@@ -296,27 +306,27 @@ def main():
         return
 
     if args.block:
-        ip = str(ipaddress.ip_address(args.block))
+        ip = validate_cli_ip(args.block)
         db.remove_white(ip)
         db.add_block(ip, notes="Manual CLI block", source="minecraft-guard/manual")
         firewall_block(ip)
         return
 
     if args.unblock:
-        ip = str(ipaddress.ip_address(args.unblock))
+        ip = validate_cli_ip(args.unblock)
         db.remove_block(ip)
         firewall_unblock(ip)
         return
 
     if args.whitelist_add:
-        ip = str(ipaddress.ip_address(args.whitelist_add))
+        ip = validate_cli_ip(args.whitelist_add)
         db.add_white(ip)
         db.remove_block(ip)
         firewall_unblock(ip)
         return
 
     if args.whitelist_remove:
-        ip = str(ipaddress.ip_address(args.whitelist_remove))
+        ip = validate_cli_ip(args.whitelist_remove)
         db.remove_white(ip)
         return
 
