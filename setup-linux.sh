@@ -28,7 +28,7 @@ done
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update
-apt-get install -y --no-install-recommends git python3 python3-venv python3-pip nginx certbot python3-certbot-nginx ufw ca-certificates
+apt-get install -y --no-install-recommends git python3 python3-venv python3-pip nginx certbot python3-certbot-nginx iptables iproute2 ca-certificates
 
 if [ ! -f "$APP_DIR/Minecraft-Guard.py" ]; then
   if [ -d "$APP_DIR/.git" ]; then
@@ -88,6 +88,10 @@ PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
 ReadWritePaths=$APP_DIR
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+
+
 
 [Install]
 WantedBy=multi-user.target
@@ -118,10 +122,6 @@ systemctl enable --now minecraft-guard
 systemctl enable --now nginx
 systemctl restart nginx
 
-ufw allow 80/tcp
-ufw allow 443/tcp
-ufw --force enable
-
 certbot --nginx --non-interactive --agree-tos --redirect --hsts --staple-ocsp -m "$EMAIL" -d "$DOMAIN"
 systemctl enable --now certbot.timer || true
 systemctl restart minecraft-guard
@@ -132,3 +132,4 @@ echo "Repository: $REPO_URL"
 echo "Application: $APP_DIR"
 echo "Web console: https://$DOMAIN"
 echo "Service: systemctl status minecraft-guard"
+echo "Firewall: iptables chain MINECRAFT_GUARD"
