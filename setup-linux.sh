@@ -30,7 +30,9 @@ cp "$REPO_DIR/minecraft-guard.py" "$APP_DIR/minecraft-guard.py"
 cp "$REPO_DIR/minecraft-guard-web.py" "$APP_DIR/minecraft-guard-web.py"
 cp "$REPO_DIR/requirements.txt" "$APP_DIR/requirements.txt"
 
-if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then python3 -m venv "$APP_DIR/venv"; fi
+if [[ ! -x "$APP_DIR/venv/bin/python" ]]; then
+  python3 -m venv "$APP_DIR/venv"
+fi
 "$APP_DIR/venv/bin/python" -m pip install --upgrade pip
 "$APP_DIR/venv/bin/pip" install -r "$APP_DIR/requirements.txt"
 
@@ -52,8 +54,14 @@ EOF
   echo "Created $ENV_FILE"
 fi
 
+# The web console and SQLite database are owned by the service account.
+# The firewall manager runs as root because it must modify iptables.
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
+touch "$APP_DIR/blacklist.db"
+chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/blacklist.db"
 chmod 600 "$ENV_FILE"
+chmod 664 "$APP_DIR/blacklist.db"
+
 cat > /etc/systemd/system/minecraft-guard.service <<EOF
 [Unit]
 Description=Minecraft-Guard iptables firewall manager
@@ -62,8 +70,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_USER
+User=root
+Group=root
 WorkingDirectory=$APP_DIR
 EnvironmentFile=$ENV_FILE
 ExecStart=$APP_DIR/venv/bin/python $APP_DIR/minecraft-guard.py
@@ -99,5 +107,4 @@ systemctl enable minecraft-guard.service minecraft-guard-web.service
 
 echo "Installation complete."
 echo "Edit $ENV_FILE before starting the services."
-echo "The Guard service must use the Linux/iptables implementation."
 echo "Start with: sudo systemctl start minecraft-guard minecraft-guard-web"
