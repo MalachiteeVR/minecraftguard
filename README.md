@@ -91,6 +91,8 @@ The public URL is:
 
     https://guard.example.com
 
+The installer requires an AbuseIPDB API key because automatic reputation checks are part of the monitor. The Linux deployment therefore does not install a monitor that immediately exits because its API key is missing.
+
 The Python console is never directly exposed to the Internet. Only nginx is public.
 
 ### Updating the relay from Git
