@@ -31,7 +31,7 @@ DATACENTER_USAGE_TYPE = os.getenv("MINECRAFT_GUARD_DATACENTER_TYPE", "Data Cente
 WEB_ENABLED = os.getenv("MINECRAFT_GUARD_WEB", "1").lower() not in ("0", "false", "no")
 WEB_HOST = os.getenv("MINECRAFT_GUARD_WEB_HOST", "127.0.0.1")
 WEB_PORT = int(os.getenv("MINECRAFT_GUARD_WEB_PORT", "8080"))
-WEB_ADMIN_PASSWORD = os.getenv("MINECRAFT_GUARD_ADMIN_PASSWORD", "")
+WEB_ADMIN_PASSWORD_HASH = os.getenv("MINECRAFT_GUARD_ADMIN_PASSWORD_HASH", "")
 WEB_SESSION_TTL = int(os.getenv("MINECRAFT_GUARD_SESSION_TTL", "3600"))
 FIREWALL_LOG = Path(os.getenv("MINECRAFT_GUARD_FIREWALL_LOG", r"C:\path\to\your\pfirewall.log"))
 
@@ -56,7 +56,7 @@ DATACENTER_USAGE_TYPE = os.getenv("MINECRAFT_GUARD_DATACENTER_TYPE", DATACENTER_
 WEB_ENABLED = os.getenv("MINECRAFT_GUARD_WEB", "1").lower() not in ("0", "false", "no")
 WEB_HOST = os.getenv("MINECRAFT_GUARD_WEB_HOST", WEB_HOST)
 WEB_PORT = int(os.getenv("MINECRAFT_GUARD_WEB_PORT", str(WEB_PORT)))
-WEB_ADMIN_PASSWORD = os.getenv("MINECRAFT_GUARD_ADMIN_PASSWORD", WEB_ADMIN_PASSWORD)
+WEB_ADMIN_PASSWORD_HASH = os.getenv("MINECRAFT_GUARD_ADMIN_PASSWORD_HASH", WEB_ADMIN_PASSWORD_HASH)
 WEB_SESSION_TTL = int(os.getenv("MINECRAFT_GUARD_SESSION_TTL", str(WEB_SESSION_TTL)))
 FIREWALL_LOG = Path(os.getenv("MINECRAFT_GUARD_FIREWALL_LOG", str(FIREWALL_LOG)))
 
@@ -198,6 +198,20 @@ def abuse_check(ip, key):
     except Exception:
         return None
 
+def verify_password(password):
+    try:
+        parts = WEB_ADMIN_PASSWORD_HASH.split("$")
+        if len(parts) != 4 or parts[0] != "scrypt":
+            return False
+        n, r, p = (int(x) for x in parts[1].split(","))
+        salt = bytes.fromhex(parts[2])
+        expected = bytes.fromhex(parts[3])
+        import hashlib
+        actual = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=n, r=r, p=p, dklen=len(expected))
+        return secrets.compare_digest(actual, expected)
+    except (ValueError, TypeError):
+        return False
+
 _sessions = {}
 _sessions_lock = threading.Lock()
 
@@ -318,7 +332,7 @@ class WebHandler(BaseHTTPRequestHandler):
         form = parse_qs(self.rfile.read(length).decode(errors="replace"))
         if path == "/login":
             password = form.get("password", [""])[0]
-            if WEB_ADMIN_PASSWORD and secrets.compare_digest(password, WEB_ADMIN_PASSWORD):
+            if WEB_ADMIN_PASSWORD_HASH and verify_password(password):
                 token = new_session()
                 self.redirect("/", f"mg_session={token}; Max-Age={WEB_SESSION_TTL}; HttpOnly; SameSite=Strict")
             else:
@@ -356,8 +370,8 @@ class WebHandler(BaseHTTPRequestHandler):
 def start_web(db):
     if not WEB_ENABLED:
         return None
-    if not WEB_ADMIN_PASSWORD:
-        print("[WEB] Disabled because MINECRAFT_GUARD_ADMIN_PASSWORD is not set.")
+    if not WEB_ADMIN_PASSWORD_HASH:
+        print("[WEB] Disabled because MINECRAFT_GUARD_ADMIN_PASSWORD_HASH is not set.")
         return None
     WebHandler.db = db
     server = ThreadingHTTPServer((WEB_HOST, WEB_PORT), WebHandler)
