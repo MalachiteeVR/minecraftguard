@@ -30,15 +30,13 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update
 apt-get install -y --no-install-recommends git python3 python3-venv python3-pip nginx certbot python3-certbot-nginx iptables iproute2 ca-certificates
 
-if [ ! -f "$APP_DIR/Minecraft-Guard.py" ]; then
-  if [ -d "$APP_DIR/.git" ]; then
-    git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH"
-    git -C "$APP_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
-    git -C "$APP_DIR" reset --hard "origin/$BRANCH"
-  else
-    rm -rf "$APP_DIR"
-    git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
-  fi
+if [ -d "$APP_DIR/.git" ]; then
+  git -C "$APP_DIR" fetch --depth 1 origin "$BRANCH"
+  git -C "$APP_DIR" checkout -B "$BRANCH" "origin/$BRANCH"
+  git -C "$APP_DIR" reset --hard "origin/$BRANCH"
+elif [ ! -f "$APP_DIR/Minecraft-Guard.py" ]; then
+  rm -rf "$APP_DIR"
+  git clone --depth 1 --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
 fi
 
 id "$SERVICE_USER" >/dev/null 2>&1 || useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin "$SERVICE_USER"
