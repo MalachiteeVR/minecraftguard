@@ -1,132 +1,331 @@
-import os,re,sys,time,sqlite3,argparse,subprocess,ipaddress
+#!/usr/bin/env python3
+import argparse
+import ipaddress
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime,timezone
+
 import requests
-WORKDIR=Path(os.getenv('MINECRAFT_GUARD_WORKDIR',r'C:\Minecraft')); ENV_FILE=WORKDIR/'.env'; DB_FILE=WORKDIR/'blacklist.db'
-FIREWALL_LOG=Path(os.getenv('MINECRAFT_GUARD_FIREWALL_LOG',r'C:\Windows\System32\LogFiles\Firewall\pfirewall.log'))
-PORT=int(os.getenv('MINECRAFT_GUARD_PORT','25565')); SCAN=int(os.getenv('MINECRAFT_GUARD_SCAN_INTERVAL','3')); SYNC=int(os.getenv('MINECRAFT_GUARD_DB_SYNC_INTERVAL','5'))
-THRESHOLD=int(os.getenv('ABUSE_SCORE_THRESHOLD','10')); DATACENTER=os.getenv('DATACENTER_USAGE_TYPE','Data Center/Web Hosting/Transit')
+
+WORKDIR = Path(os.getenv("MINECRAFT_GUARD_WORKDIR", "/opt/minecraft-guard"))
+DB_FILE = WORKDIR / "blacklist.db"
+PORT = int(os.getenv("MINECRAFT_GUARD_PORT", "25565"))
+SYNC = int(os.getenv("MINECRAFT_GUARD_DB_SYNC_INTERVAL", "5"))
+THRESHOLD = int(os.getenv("ABUSE_SCORE_THRESHOLD", "10"))
+DATACENTER = os.getenv("DATACENTER_USAGE_TYPE", "Data Center/Web Hosting/Transit")
+CHAIN = "MINECRAFT_GUARD"
+
+
 def load_dotenv():
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding='utf-8-sig').splitlines():
-            line=line.strip()
-            if line and not line.startswith('#') and '=' in line:
-                k,v=line.split('=',1); os.environ[k.strip()]=v.strip().strip('"'')
+    env_file = WORKDIR / ".env"
+    if env_file.exists():
+        for raw in env_file.read_text(encoding="utf-8-sig").splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#") and "=" in line:
+                key, value = line.split("=", 1)
+                os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
 
 class GuardDB:
-    def __init__(self,p): self.p=p; self.init()
-    def c(self):
-        x=sqlite3.connect(self.p,timeout=10); x.execute('PRAGMA busy_timeout=10000'); return x
+    def __init__(self, path):
+        self.path = path
+        self.init()
+
+    def connect(self):
+        db = sqlite3.connect(self.path, timeout=10)
+        db.execute("PRAGMA busy_timeout=10000")
+        return db
+
     def init(self):
-        with self.c() as x:
-            x.execute('CREATE TABLE IF NOT EXISTS blacklist (ip TEXT PRIMARY KEY,blocked_at TEXT NOT NULL,updated_at TEXT NOT NULL,source TEXT NOT NULL,abuse_score INTEGER,usage_type TEXT,country_code TEXT,isp TEXT,domain TEXT,notes TEXT)')
-            x.execute('CREATE TABLE IF NOT EXISTS whitelist (ip TEXT PRIMARY KEY,added_at TEXT NOT NULL,notes TEXT)')
+        with self.connect() as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS blacklist (
+                ip TEXT PRIMARY KEY,
+                blocked_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                source TEXT NOT NULL,
+                abuse_score INTEGER,
+                usage_type TEXT,
+                country_code TEXT,
+                isp TEXT,
+                domain TEXT,
+                notes TEXT
+            )""")
+            db.execute("""CREATE TABLE IF NOT EXISTS whitelist (
+                ip TEXT PRIMARY KEY,
+                added_at TEXT NOT NULL,
+                notes TEXT
+            )""")
+
     def blocked(self):
-        with self.c() as x:return {r[0] for r in x.execute('SELECT ip FROM blacklist')}
+        with self.connect() as db:
+            return {r[0] for r in db.execute("SELECT ip FROM blacklist")}
+
     def white(self):
-        with self.c() as x:return {r[0] for r in x.execute('SELECT ip FROM whitelist')}
-    def is_white(self,ip): return ip in self.white()
-    def is_blocked(self,ip): return ip in self.blocked()
-    def add_block(self,ip,score=None,usage=None,country=None,isp=None,domain=None,notes=None,source='minecraft-guard/AbuseIPDB'):
-        n=datetime.now(timezone.utc).isoformat()
-        with self.c() as x:x.execute('INSERT INTO blacklist(ip,blocked_at,updated_at,source,abuse_score,usage_type,country_code,isp,domain,notes) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(ip) DO UPDATE SET updated_at=excluded.updated_at,source=excluded.source,abuse_score=excluded.abuse_score,usage_type=excluded.usage_type,country_code=excluded.country_code,isp=excluded.isp,domain=excluded.domain,notes=excluded.notes',(ip,n,n,source,score,usage,country,isp,domain,notes))
-    def remove_block(self,ip):
-        with self.c() as x:x.execute('DELETE FROM blacklist WHERE ip=?',(ip,))
-    def add_white(self,ip,notes='Manual Whitelist'):
-        n=datetime.now(timezone.utc).isoformat()
-        with self.c() as x:x.execute('INSERT INTO whitelist(ip,added_at,notes) VALUES(?,?,?) ON CONFLICT(ip) DO UPDATE SET added_at=excluded.added_at,notes=excluded.notes',(ip,n,notes))
-    def remove_white(self,ip):
-        with self.c() as x:x.execute('DELETE FROM whitelist WHERE ip=?',(ip,))
-    def lists(self):
-        with self.c() as x:return x.execute('SELECT ip,blocked_at,updated_at,source,abuse_score,usage_type,country_code,isp,domain,notes FROM blacklist ORDER BY blocked_at DESC').fetchall(),x.execute('SELECT ip,added_at,notes FROM whitelist ORDER BY added_at DESC').fetchall()
+        with self.connect() as db:
+            return {r[0] for r in db.execute("SELECT ip FROM whitelist")}
 
-def public(ip):
-    try:return ipaddress.ip_address(ip).version==4 and ipaddress.ip_address(ip).is_global
-    except:return False
+    def is_white(self, ip):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM whitelist WHERE ip=?", (ip,)).fetchone() is not None
 
-def fw(args):return subprocess.run(['netsh','advfirewall','firewall']+args,capture_output=True,text=True,timeout=15)
-def rname(ip):return f'MinecraftGuard_Block_{ip}'
-def block(ip):
-    if not public(ip):return False
-    n=rname(ip); q=fw(['show','rule',f'name={n}'])
-    if q.returncode==0 and 'No rules match' not in q.stdout+q.stderr:return True
-    q=fw(['add','rule',f'name={n}','dir=in','action=block','protocol=TCP',f'localport={PORT}',f'remoteip={ip}'])
-    if q.returncode==0: print(f'[FIREWALL] Blocked {ip} TCP/{PORT}');return True
-    print(f'[ERROR] Firewall block failed: {q.stderr.strip()}');return False
+    def is_blocked(self, ip):
+        with self.connect() as db:
+            return db.execute("SELECT 1 FROM blacklist WHERE ip=?", (ip,)).fetchone() is not None
 
-def unblock(ip):
-    q=fw(['delete','rule',f'name={rname(ip)}'])
-    if q.returncode==0 or 'No rules match' in q.stdout+q.stderr: print(f'[FIREWALL] Unblocked {ip}');return True
-    print(f'[ERROR] Firewall unblock failed: {q.stderr.strip()}');return False
+    def add_block(self, ip, score=None, usage=None, country=None, isp=None,
+                  domain=None, notes=None, source="minecraft-guard/AbuseIPDB"):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO blacklist
+                (ip, blocked_at, updated_at, source, abuse_score, usage_type,
+                 country_code, isp, domain, notes)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(ip) DO UPDATE SET
+                updated_at=excluded.updated_at, source=excluded.source,
+                abuse_score=excluded.abuse_score, usage_type=excluded.usage_type,
+                country_code=excluded.country_code, isp=excluded.isp,
+                domain=excluded.domain, notes=excluded.notes""",
+                (ip, now, now, source, score, usage, country, isp, domain, notes),
+            )
 
-def sync(db,applied):
-    desired=db.blocked()-db.white()
-    for ip in desired-applied:
-        if block(ip):applied.add(ip)
-    for ip in applied-desired:
-        if unblock(ip):applied.discard(ip)
-    return applied
+    def remove_block(self, ip):
+        with self.connect() as db:
+            db.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
 
-def netstat_ips():
-    out=set()
+    def add_white(self, ip, notes="Manual Whitelist"):
+        now = datetime.now(timezone.utc).isoformat()
+        with self.connect() as db:
+            db.execute(
+                """INSERT INTO whitelist(ip, added_at, notes) VALUES (?, ?, ?)
+                ON CONFLICT(ip) DO UPDATE SET added_at=excluded.added_at,
+                notes=excluded.notes""",
+                (ip, now, notes),
+            )
+
+    def remove_white(self, ip):
+        with self.connect() as db:
+            db.execute("DELETE FROM whitelist WHERE ip=?", (ip,))
+
+
+def valid_public_ipv4(ip):
     try:
-        s=subprocess.run(['netstat','-ano','-p','tcp'],capture_output=True,text=True,check=True).stdout
-        rx=re.compile(rf'^\s*TCP\s+\S+:{PORT}\s+(\d{{1,3}}(?:\.\d{{1,3}}){{3}}):\d+\s+ESTABLISHED',re.M)
-        for m in rx.finditer(s):
-            if public(m.group(1)):out.add(m.group(1))
-    except:pass
-    return out
+        addr = ipaddress.ip_address(ip)
+        return addr.version == 4 and addr.is_global
+    except ValueError:
+        return False
 
-def log_ips(pos):
-    out=set()
-    if not FIREWALL_LOG.exists():return out,pos
+
+def iptables(args, check=False):
+    return subprocess.run(
+        ["iptables", "-w", "5"] + args,
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=check,
+    )
+
+
+def ensure_firewall_chain():
+    result = iptables(["-N", CHAIN])
+    if result.returncode != 0 and "Chain already exists" not in result.stderr:
+        raise RuntimeError(f"Could not create {CHAIN}: {result.stderr.strip()}")
+
+    iptables(["-F", CHAIN])
+
+    jump = ["-I", "INPUT", "1", "-p", "tcp", "--dport", str(PORT), "-j", CHAIN]
+    existing = iptables(["-C", "INPUT", "-p", "tcp", "--dport", str(PORT), "-j", CHAIN])
+    if existing.returncode != 0:
+        iptables(jump)
+
+    print(f"[FIREWALL] {CHAIN} active before other INPUT rules for TCP/{PORT}")
+
+
+def current_firewall_ips():
+    result = iptables(["-S", CHAIN])
+    if result.returncode != 0:
+        return set()
+    found = set()
+    for line in result.stdout.splitlines():
+        match = re.search(r"^-A\s+" + re.escape(CHAIN) + r"\s+-s\s+(\d+\.\d+\.\d+\.\d+)\s+-j\s+DROP$", line.strip())
+        if match:
+            found.add(match.group(1))
+    return found
+
+
+def firewall_block(ip):
+    if not valid_public_ipv4(ip):
+        return False
+    if ip in current_firewall_ips():
+        return True
+    result = iptables(["-A", CHAIN, "-s", ip, "-j", "DROP"])
+    if result.returncode == 0:
+        print(f"[FIREWALL] Blocked {ip} TCP/{PORT}")
+        return True
+    print(f"[ERROR] iptables block failed for {ip}: {result.stderr.strip()}")
+    return False
+
+
+def firewall_unblock(ip):
+    while True:
+        result = iptables(["-D", CHAIN, "-s", ip, "-j", "DROP"])
+        if result.returncode != 0:
+            break
+    if result.returncode == 0 or "Bad rule" in result.stderr or "No chain/target" in result.stderr:
+        print(f"[FIREWALL] Unblocked {ip}")
+        return True
+    return True
+
+
+def sync_firewall(db):
+    desired = db.blocked() - db.white()
+    applied = current_firewall_ips()
+
+    for ip in desired - applied:
+        firewall_block(ip)
+
+    for ip in applied - desired:
+        firewall_unblock(ip)
+
+
+def connected_client_ips():
+    clients = set()
     try:
-        with FIREWALL_LOG.open('r',encoding='utf-8',errors='ignore') as f:f.seek(pos); lines=f.readlines(); pos=f.tell()
-        for line in lines:
-            p=line.split()
-            if len(p)>=8 and p[7]==str(PORT) and public(p[4]):out.add(p[4])
-    except Exception as e:print('[WARN] firewall log:',e)
-    return out,pos
+        result = subprocess.run(["ss", "-Htn", "state", "established"],
+                                capture_output=True, text=True, timeout=10)
+        for line in result.stdout.splitlines():
+            fields = line.split()
+            if len(fields) < 4:
+                continue
+            local = fields[2]
+            remote = fields[3]
+            if not local.rsplit(":", 1)[-1] == str(PORT):
+                continue
+            remote_ip = remote.rsplit(":", 1)[0]
+            if remote_ip.startswith("[") and remote_ip.endswith("]"):
+                remote_ip = remote_ip[1:-1]
+            if valid_public_ipv4(remote_ip):
+                clients.add(remote_ip)
+    except Exception as exc:
+        print(f"[WARN] Could not inspect connections: {exc}")
+    return clients
 
-def abuse(ip,key):
+
+def abuse_check(ip, api_key):
     try:
-        r=requests.get('https://api.abuseipdb.com/api/v2/check',headers={'Key':key,'Accept':'application/json'},params={'ipAddress':ip,'maxAgeInDays':'90','verbose':''},timeout=10)
-        return r.json().get('data') if r.status_code==200 else None
-    except:return None
+        response = requests.get(
+            "https://api.abuseipdb.com/api/v2/check",
+            headers={"Key": api_key, "Accept": "application/json"},
+            params={"ipAddress": ip, "maxAgeInDays": "90"},
+            timeout=10,
+        )
+        if response.status_code == 200:
+            return response.json().get("data")
+    except requests.RequestException as exc:
+        print(f"[WARN] AbuseIPDB check failed for {ip}: {exc}")
+    return None
 
-def discord(url,title,color,fields):
-    if url:
-        try:requests.post(url,json={'embeds':[{'title':title,'color':color,'fields':fields,'timestamp':datetime.now(timezone.utc).isoformat()}]},timeout=5)
-        except:pass
 
-def process(ip,db,key,hook):
-    if db.is_white(ip) or db.is_blocked(ip):return
-    d=abuse(ip,key)
-    if not d:return
-    score=d.get('abuseConfidenceScore',0); usage=d.get('usageType','Unknown'); country=d.get('countryCode','Unknown'); isp=d.get('isp','Unknown'); domain=d.get('domain','N/A'); reasons=[]
-    if score>=THRESHOLD:reasons.append(f'Abuse score {score}% >= threshold {THRESHOLD}%')
-    if usage==DATACENTER:reasons.append(f"Usage type '{usage}' matched policy")
+def process_client(ip, db, api_key):
+    if db.is_white(ip) or db.is_blocked(ip):
+        return
+
+    data = abuse_check(ip, api_key)
+    if not data:
+        return
+
+    score = int(data.get("abuseConfidenceScore", 0) or 0)
+    usage = data.get("usageType", "Unknown")
+    country = data.get("countryCode", "Unknown")
+    isp = data.get("isp", "Unknown")
+    domain = data.get("domain", "N/A")
+    reasons = []
+
+    if score >= THRESHOLD:
+        reasons.append(f"Abuse score {score}% >= {THRESHOLD}%")
+    if usage == DATACENTER:
+        reasons.append(f"usage type '{usage}' matched policy")
+
     if reasons:
-        reason='; '.join(reasons); db.add_block(ip,score,usage,country,isp,domain,reason); block(ip); discord(hook,f'Blocked: {ip}',0xE74C3C,[{'name':'IP','value':ip},{'name':'Reason','value':reason}])
+        reason = "; ".join(reasons)
+        db.add_block(ip, score, usage, country, isp, domain, reason)
+        firewall_block(ip)
+        print(f"[GUARD] Automatically blocked {ip}: {reason}")
+
 
 def main():
-    load_dotenv(); db=GuardDB(DB_FILE); ap=argparse.ArgumentParser(); ap.add_argument('--list',action='store_true');ap.add_argument('--block');ap.add_argument('--unblock');ap.add_argument('--whitelist-add');ap.add_argument('--whitelist-remove');ap.add_argument('--whitelist-list',action='store_true');a=ap.parse_args()
-    if a.list or a.whitelist_list:
-        b,w=db.lists(); print(b if a.list else w);return
-    if a.block:db.add_block(a.block,notes='Manual CLI block',source='minecraft-guard/manual');block(a.block);return
-    if a.unblock:db.remove_block(a.unblock);unblock(a.unblock);return
-    if a.whitelist_add:db.add_white(a.whitelist_add);db.remove_block(a.whitelist_add);unblock(a.whitelist_add);return
-    if a.whitelist_remove:db.remove_white(a.whitelist_remove);return
-    key=os.getenv('ABUSEIPDB_API_KEY'); hook=os.getenv('DISCORD_WEBHOOK_URL')
-    if not key:sys.exit('[ERROR] ABUSEIPDB_API_KEY is missing.')
-    applied=set();seen=set();pos=FIREWALL_LOG.stat().st_size if FIREWALL_LOG.exists() else 0
-    print(f'[GUARD] DB sync every {SYNC}s. Firewall: Windows Defender Firewall. Minecraft TCP/{PORT}.')
+    load_dotenv()
+
+    if os.geteuid() != 0:
+        sys.exit("[ERROR] minecraft-guard must run as root so it can manage iptables.")
+
+    db = GuardDB(DB_FILE)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--block")
+    parser.add_argument("--unblock")
+    parser.add_argument("--whitelist-add")
+    parser.add_argument("--whitelist-remove")
+    args = parser.parse_args()
+
+    if args.list:
+        with db.connect() as conn:
+            for row in conn.execute("SELECT * FROM blacklist ORDER BY blocked_at DESC"):
+                print(row)
+        return
+
+    if args.block:
+        db.remove_white(args.block)
+        db.add_block(args.block, notes="Manual CLI block", source="minecraft-guard/manual")
+        firewall_block(args.block)
+        return
+
+    if args.unblock:
+        db.remove_block(args.unblock)
+        firewall_unblock(args.unblock)
+        return
+
+    if args.whitelist_add:
+        db.add_white(args.whitelist_add)
+        db.remove_block(args.whitelist_add)
+        firewall_unblock(args.whitelist_add)
+        return
+
+    if args.whitelist_remove:
+        db.remove_white(args.whitelist_remove)
+        return
+
+    ensure_firewall_chain()
+    sync_firewall(db)
+
+    api_key = os.getenv("ABUSEIPDB_API_KEY", "").strip()
+    seen = set()
+
+    print(f"[GUARD] Running. DB sync every {SYNC}s. Monitoring TCP/{PORT}.")
+    print(f"[GUARD] Shared database: {DB_FILE}")
+
     while True:
         try:
-            applied=sync(db,applied); ips,pos=log_ips(pos);ips|=netstat_ips()
-            for ip in ips-seen:seen.add(ip);process(ip,db,key,hook)
-            time.sleep(SYNC)
-        except KeyboardInterrupt:return
-        except Exception as e:print('[ERROR]',e);time.sleep(3)
+            sync_firewall(db)
 
-if __name__=='__main__':main()
+            clients = connected_client_ips()
+            for ip in clients - seen:
+                process_client(ip, db, api_key) if api_key else None
+
+            seen = clients
+            time.sleep(SYNC)
+        except KeyboardInterrupt:
+            break
+        except Exception as exc:
+            print(f"[ERROR] {exc}")
+            time.sleep(SYNC)
+
+
+if __name__ == "__main__":
+    main()
