@@ -382,7 +382,7 @@ class WebHandler(BaseHTTPRequestHandler):
             password = form.get("password", [""])[0]
             if WEB_ADMIN_PASSWORD_HASH and verify_password(password):
                 token = new_session()
-                self.redirect("/", f"mg_session={token}; Max-Age={WEB_SESSION_TTL}; HttpOnly; SameSite=Strict")
+                self.redirect("/", f"mg_session={token}; Max-Age={WEB_SESSION_TTL}; HttpOnly; Secure; SameSite=Strict")
             else:
                 self.send(401, page("Login", '<main><div class="card"><h1>Login failed</h1><form method="post"><input type="password" name="password"><button>Login</button></form></div></main>'))
             return
@@ -393,18 +393,24 @@ class WebHandler(BaseHTTPRequestHandler):
             self.send(400, page("Bad IP", "<main><div class='card'><h1>Invalid public IPv4 address</h1></div></main>"))
             return
         if path == "/block":
-            firewall_block(ip)
+            if not firewall_block(ip):
+                self.send(500, page("Firewall Error", "<main><div class='card'><h1>Firewall block failed</h1></div></main>"))
+                return
             self.db.add_blacklist(ip, notes="Web console manual block")
             self.db.audit("BLOCK", ip, "web console")
             self.redirect("/blacklist")
         elif path == "/unblock":
-            firewall_unblock(ip)
+            if not firewall_unblock(ip):
+                self.send(500, page("Firewall Error", "<main><div class='card'><h1>Firewall unblock failed</h1></div></main>"))
+                return
             self.db.remove_blacklist(ip)
             self.db.audit("UNBLOCK", ip, "web console")
             self.redirect("/blacklist")
         elif path == "/whitelist-add":
+            if not firewall_unblock(ip):
+                self.send(500, page("Firewall Error", "<main><div class='card'><h1>Firewall unblock failed</h1></div></main>"))
+                return
             self.db.add_whitelist(ip)
-            firewall_unblock(ip)
             self.db.remove_blacklist(ip)
             self.db.audit("WHITELIST_ADD", ip, "web console")
             self.redirect("/whitelist")
@@ -475,14 +481,14 @@ def main():
 
     if args.block:
         if public_ipv4(args.block):
-            firewall_block(args.block)
-            db.add_blacklist(args.block, notes="CLI manual block")
+            if firewall_block(args.block):
+                db.add_blacklist(args.block, notes="CLI manual block")
             print(f"Blocked {args.block}")
         return
     if args.unblock:
         if public_ipv4(args.unblock):
-            firewall_unblock(args.unblock)
-            db.remove_blacklist(args.unblock)
+            if firewall_unblock(args.unblock):
+                db.remove_blacklist(args.unblock)
             print(f"Unblocked {args.unblock}")
         return
     if args.whitelist_add:
