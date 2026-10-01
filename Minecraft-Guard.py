@@ -49,6 +49,10 @@ def load_dotenv():
         print(f"[WARN] Could not read {ENV_FILE}: {exc}")
 
 load_dotenv()
+WORKDIR = Path(os.getenv("MINECRAFT_GUARD_WORKDIR", str(WORKDIR)))
+ENV_FILE = WORKDIR / ".env"
+DB_FILE = WORKDIR / "minecraft-guard.db"
+AUDIT_LOG = WORKDIR / "minecraft-guard-web-audit.log"
 MINECRAFT_PORT = int(os.getenv("MINECRAFT_GUARD_PORT", str(MINECRAFT_PORT)))
 SCAN_INTERVAL_SECONDS = int(os.getenv("MINECRAFT_GUARD_SCAN_INTERVAL", str(SCAN_INTERVAL_SECONDS)))
 ABUSE_SCORE_THRESHOLD = int(os.getenv("MINECRAFT_GUARD_ABUSE_THRESHOLD", str(ABUSE_SCORE_THRESHOLD)))
@@ -154,7 +158,39 @@ def public_ipv4(ip):
         return False
     return True
 
+LINUX = os.name == "posix"
+IPTABLES_CHAIN = os.getenv("MINECRAFT_GUARD_IPTABLES_CHAIN", "MINECRAFT_GUARD")
+
+def _iptables(*args, check=True):
+    return subprocess.run(["iptables", *args], capture_output=True, text=True, check=check)
+
+def firewall_init(db=None):
+    if not LINUX:
+        return True
+    try:
+        _iptables("-N", IPTABLES_CHAIN, check=False)
+        if _iptables("-C", "INPUT", "-j", IPTABLES_CHAIN, check=False).returncode != 0:
+            _iptables("-I", "INPUT", "1", "-j", IPTABLES_CHAIN)
+        if db is not None:
+            _iptables("-F", IPTABLES_CHAIN)
+            for row in db.blacklisted():
+                ip = row[0]
+                if not db.is_whitelisted(ip):
+                    _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+        return True
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"[ERROR] iptables initialization failed: {exc}")
+        return False
+
 def firewall_block(ip):
+    if LINUX:
+        try:
+            if _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False).returncode != 0:
+                _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            print(f"[ERROR] iptables block failed for {ip}: {exc}")
+            return False
     rule = f"MinecraftGuard_Block_{ip}"
     ps = f"if (-not (Get-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue)) {{ New-NetFirewallRule -DisplayName '{rule}' -Direction Inbound -Action Block -RemoteAddress '{ip}' -Enabled True }}"
     try:
@@ -165,6 +201,14 @@ def firewall_block(ip):
         return False
 
 def firewall_unblock(ip):
+    if LINUX:
+        try:
+            while _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False).returncode == 0:
+                _iptables("-D", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+            return True
+        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+            print(f"[ERROR] iptables unblock failed for {ip}: {exc}")
+            return False
     rule = f"MinecraftGuard_Block_{ip}"
     ps = f"Remove-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue"
     try:
@@ -177,8 +221,12 @@ def firewall_unblock(ip):
 def netstat_ips():
     found = set()
     try:
-        out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, check=True).stdout
-        rx = re.compile(rf"^\s*TCP\s+\S+:{MINECRAFT_PORT}\s+(\d{{1,3}}(?:\.\d{{1,3}}){{3}}):\d+\s+ESTABLISHED", re.MULTILINE)
+        if LINUX:
+            out = subprocess.run(["ss", "-tn"], capture_output=True, text=True, check=True).stdout
+            rx = re.compile(rf"^ESTAB\s+\d+\s+\d+\s+\S+:MINECRAFT_PORT\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+", re.MULTILINE)
+        else:
+            out = subprocess.run(["netstat", "-ano", "-p", "tcp"], capture_output=True, text=True, check=True).stdout
+            rx = re.compile(rf"^\s*TCP\s+\S+:{MINECRAFT_PORT}\s+(\d{1,3}(?:\.\d{1,3}){3}):\d+\s+ESTABLISHED", re.MULTILINE)
         for m in rx.finditer(out):
             if public_ipv4(m.group(1)):
                 found.add(m.group(1))
@@ -422,6 +470,7 @@ def main():
     args = parser.parse_args()
 
     db = GuardDB(DB_FILE)
+    firewall_init(db)
     start_web(db)
 
     if args.block:
