@@ -191,10 +191,29 @@ def firewall_init(db=None):
         print(f"[ERROR] iptables initialization failed: {_iptables_error(exc)}")
         return False
 
+def firewall_ready():
+    if not LINUX:
+        return True
+    try:
+        create = _iptables("-N", IPTABLES_CHAIN, check=False)
+        if create.returncode not in (0, 1):
+            print(f"[ERROR] Could not create/check iptables chain: {_iptables_error(create)}")
+            return False
+        jump = _iptables("-C", "INPUT", "-j", IPTABLES_CHAIN, check=False)
+        if jump.returncode != 0:
+            result = _iptables("-I", "INPUT", "1", "-j", IPTABLES_CHAIN, check=False)
+            if result.returncode != 0:
+                print(f"[ERROR] Could not attach {IPTABLES_CHAIN} to INPUT: {_iptables_error(result)}")
+                return False
+        return True
+    except FileNotFoundError as exc:
+        print(f"[ERROR] iptables not found: {exc}")
+        return False
+
 def firewall_block(ip):
     if LINUX:
         try:
-            if not firewall_init():
+            if not firewall_ready():
                 return False
             check = _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
             if check.returncode == 0:
@@ -227,7 +246,7 @@ def firewall_block(ip):
 def firewall_unblock(ip):
     if LINUX:
         try:
-            if not firewall_init():
+            if not firewall_ready():
                 return False
             while _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False).returncode == 0:
                 result = _iptables("-D", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
