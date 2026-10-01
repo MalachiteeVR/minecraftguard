@@ -152,34 +152,68 @@ LINUX = os.name == "posix"
 IPTABLES_CHAIN = os.getenv("MINECRAFT_GUARD_IPTABLES_CHAIN", "MINECRAFT_GUARD")
 
 def _iptables(*args, check=True):
-    return subprocess.run(["iptables", *args], capture_output=True, text=True, check=check)
+    return subprocess.run(["iptables", "-w", "5", *args], capture_output=True, text=True, check=check)
+
+def _iptables_error(result):
+    return (result.stderr or result.stdout or "").strip() or f"iptables exited with status {result.returncode}"
 
 def firewall_init(db=None):
     if not LINUX:
         return True
     try:
-        _iptables("-N", IPTABLES_CHAIN, check=False)
-        if _iptables("-C", "INPUT", "-j", IPTABLES_CHAIN, check=False).returncode != 0:
-            _iptables("-I", "INPUT", "1", "-j", IPTABLES_CHAIN)
+        create = _iptables("-N", IPTABLES_CHAIN, check=False)
+        if create.returncode not in (0, 1):
+            raise subprocess.CalledProcessError(create.returncode, create.args, output=create.stdout, stderr=create.stderr)
+
+        jump = _iptables("-C", "INPUT", "-j", IPTABLES_CHAIN, check=False)
+        if jump.returncode != 0:
+            result = _iptables("-I", "INPUT", "1", "-j", IPTABLES_CHAIN, check=False)
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+
+        flush = _iptables("-F", IPTABLES_CHAIN, check=False)
+        if flush.returncode != 0:
+            raise subprocess.CalledProcessError(flush.returncode, flush.args, output=flush.stdout, stderr=flush.stderr)
+
         if db is not None:
-            _iptables("-F", IPTABLES_CHAIN)
             for row in db.blacklisted():
                 ip = row[0]
                 if not db.is_whitelisted(ip):
-                    _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+                    result = _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
+                    if result.returncode != 0:
+                        raise subprocess.CalledProcessError(result.returncode, result.args, output=result.stdout, stderr=result.stderr)
+        print(f"[FIREWALL] iptables chain {IPTABLES_CHAIN} active on INPUT")
         return True
-    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
-        print(f"[ERROR] iptables initialization failed: {exc}")
+    except FileNotFoundError as exc:
+        print(f"[ERROR] iptables not found: {exc}")
+        return False
+    except subprocess.CalledProcessError as exc:
+        print(f"[ERROR] iptables initialization failed: {_iptables_error(exc)}")
         return False
 
 def firewall_block(ip):
     if LINUX:
         try:
-            if _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False).returncode != 0:
-                _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+            if not firewall_init():
+                return False
+            check = _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
+            if check.returncode == 0:
+                return True
+            result = _iptables("-A", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
+            if result.returncode != 0:
+                print(f"[ERROR] iptables block failed for {ip}: {_iptables_error(result)}")
+                return False
+            verify = _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
+            if verify.returncode != 0:
+                print(f"[ERROR] iptables block verification failed for {ip}: {_iptables_error(verify)}")
+                return False
+            print(f"[FIREWALL] BLOCK {ip} via {IPTABLES_CHAIN}")
             return True
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        except FileNotFoundError as exc:
             print(f"[ERROR] iptables block failed for {ip}: {exc}")
+            return False
+        except subprocess.CalledProcessError as exc:
+            print(f"[ERROR] iptables block failed for {ip}: {_iptables_error(exc)}")
             return False
     rule = f"MinecraftGuard_Block_{ip}"
     ps = f"if (-not (Get-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue)) {{ New-NetFirewallRule -DisplayName '{rule}' -Direction Inbound -Action Block -RemoteAddress '{ip}' -Enabled True }}"
@@ -193,11 +227,19 @@ def firewall_block(ip):
 def firewall_unblock(ip):
     if LINUX:
         try:
+            if not firewall_init():
+                return False
             while _iptables("-C", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False).returncode == 0:
-                _iptables("-D", IPTABLES_CHAIN, "-s", ip, "-j", "DROP")
+                result = _iptables("-D", IPTABLES_CHAIN, "-s", ip, "-j", "DROP", check=False)
+                if result.returncode != 0:
+                    print(f"[ERROR] iptables unblock failed for {ip}: {_iptables_error(result)}")
+                    return False
             return True
-        except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        except FileNotFoundError as exc:
             print(f"[ERROR] iptables unblock failed for {ip}: {exc}")
+            return False
+        except subprocess.CalledProcessError as exc:
+            print(f"[ERROR] iptables unblock failed for {ip}: {_iptables_error(exc)}")
             return False
     rule = f"MinecraftGuard_Block_{ip}"
     ps = f"Remove-NetFirewallRule -DisplayName '{rule}' -ErrorAction SilentlyContinue"
@@ -466,7 +508,9 @@ def main():
     args = parser.parse_args()
 
     db = GuardDB(DB_FILE)
-    firewall_init(db)
+    if LINUX and not firewall_init(db):
+        print("[ERROR] Minecraft-Guard cannot start without working iptables enforcement.")
+        raise SystemExit(1)
     start_web(db)
 
     if args.block:
