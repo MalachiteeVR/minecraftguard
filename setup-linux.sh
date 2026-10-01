@@ -48,7 +48,7 @@ python3 -m venv "$APP_DIR/venv"
 read -r -s -p "Admin password (12+ chars): " P1; echo
 read -r -s -p "Confirm password: " P2; echo
 [ "$P1" = "$P2" ] || { unset P1 P2; echo "Passwords do not match."; exit 1; }
-[ \${#P1} -ge 12 ] || { unset P1 P2; echo "Password must be at least 12 characters."; exit 1; }
+[ ${#P1} -ge 12 ] || { unset P1 P2; echo "Password must be at least 12 characters."; exit 1; }
 
 HASH=$(python3 -c 'import hashlib,secrets,sys; p=sys.argv[1].encode(); s=secrets.token_bytes(16); n,r,q=16384,8,1; d=hashlib.scrypt(p,salt=s,n=n,r=r,p=q,dklen=32); print("scrypt$%d,%d,%d$%s$%s" % (n,r,q,s.hex(),d.hex()))' "$P1")
 unset P1 P2
