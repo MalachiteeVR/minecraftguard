@@ -1,1 +1,3 @@
-requests>=2.31.0\nFlask>=3.0.0\nWerkzeug>=3.0.0\n
+requests>=2.31.0
+Flask>=3.0.0
+Werkzeug>=3.0.0
