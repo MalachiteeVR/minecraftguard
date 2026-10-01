@@ -7,6 +7,7 @@ import subprocess
 import secrets
 import threading
 import html
+import ipaddress
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 from pathlib import Path
@@ -141,22 +142,11 @@ class GuardDB:
             pass
 
 def public_ipv4(ip):
-    parts = ip.split(".")
-    if len(parts) != 4:
-        return False
     try:
-        a,b,c,d = map(int, parts)
+        address = ipaddress.ip_address(ip)
+        return address.version == 4 and address.is_global
     except ValueError:
         return False
-    if any(x < 0 or x > 255 for x in (a,b,c,d)):
-        return False
-    if a in (10,127) or a >= 224 or (a == 192 and b == 168) or (a == 172 and 16 <= b <= 31):
-        return False
-    if a == 100 and 64 <= b <= 127:
-        return False
-    if a == 169 and b == 254:
-        return False
-    return True
 
 LINUX = os.name == "posix"
 IPTABLES_CHAIN = os.getenv("MINECRAFT_GUARD_IPTABLES_CHAIN", "MINECRAFT_GUARD")
