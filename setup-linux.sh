@@ -53,6 +53,8 @@ read -r -s -p "Confirm password: " P2; echo
 HASH=$(python3 -c 'import hashlib,secrets,sys; p=sys.argv[1].encode(); s=secrets.token_bytes(16); n,r,q=16384,8,1; d=hashlib.scrypt(p,salt=s,n=n,r=r,p=q,dklen=32); print("scrypt$%d,%d,%d$%s$%s" % (n,r,q,s.hex(),d.hex()))' "$P1")
 unset P1 P2
 
+read -r -s -p "AbuseIPDB API key (leave blank to disable automatic reputation checks): " ABUSEIPDB_API_KEY; echo
+
 cat > "$APP_DIR/.env" <<EOF
 MINECRAFT_GUARD_WORKDIR=$APP_DIR
 MINECRAFT_GUARD_WEB=1
@@ -62,7 +64,9 @@ MINECRAFT_GUARD_ADMIN_PASSWORD_HASH=$HASH
 MINECRAFT_GUARD_PORT=25565
 MINECRAFT_GUARD_SCAN_INTERVAL=5
 MINECRAFT_GUARD_ABUSE_THRESHOLD=75
+ABUSEIPDB_API_KEY=$ABUSEIPDB_API_KEY
 EOF
+unset ABUSEIPDB_API_KEY
 chown "$SERVICE_USER:$SERVICE_USER" "$APP_DIR/.env"
 chmod 600 "$APP_DIR/.env"
 
@@ -88,8 +92,7 @@ ProtectHome=true
 ReadWritePaths=$APP_DIR
 AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
-
-
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 
 [Install]
 WantedBy=multi-user.target
