@@ -53,7 +53,8 @@ read -r -s -p "Confirm password: " P2; echo
 HASH=$(python3 -c 'import hashlib,secrets,sys; p=sys.argv[1].encode(); s=secrets.token_bytes(16); n,r,q=16384,8,1; d=hashlib.scrypt(p,salt=s,n=n,r=r,p=q,dklen=32); print("scrypt$%d,%d,%d$%s$%s" % (n,r,q,s.hex(),d.hex()))' "$P1")
 unset P1 P2
 
-read -r -s -p "AbuseIPDB API key (leave blank to disable automatic reputation checks): " ABUSEIPDB_API_KEY; echo
+read -r -s -p "AbuseIPDB API key: " ABUSEIPDB_API_KEY; echo
+[ -n "$ABUSEIPDB_API_KEY" ] || { unset ABUSEIPDB_API_KEY; echo "An AbuseIPDB API key is required for automatic reputation checks."; exit 1; }
 
 cat > "$APP_DIR/.env" <<EOF
 MINECRAFT_GUARD_WORKDIR=$APP_DIR
