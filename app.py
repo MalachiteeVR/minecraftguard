@@ -53,6 +53,13 @@ form.inline{display:inline}.pill{display:inline-block;padding:3px 8px;border-rad
 <form class="inline" method="post" action="/connection/{{c.session}}/close" onsubmit="return confirm('Close this connection?')"><button class="red">Close</button></form>
 <form class="inline" method="post" action="/block/{{c.ip}}" onsubmit="return confirm('Block {{c.ip}}? This will also close its current connections.')"><button class="dark">Block IP</button></form></td></tr>
 {% else %}<tr><td colspan="5" class="empty">No active Minecraft connections.</td></tr>{% endfor %}</tbody></table></section>
+<section class="panel"><div class="toolbar"><h2>Manual IP Block</h2></div>
+<form method="post" action="/block" style="display:flex;gap:8px;flex-wrap:wrap" onsubmit="return confirm('Block this IP? Any current connections from it will also be closed.')">
+<input name="ip" type="text" inputmode="numeric" placeholder="IP address, e.g. 203.0.113.10" required style="flex:1;min-width:220px;padding:10px;background:#0c131c;border:1px solid var(--line);border-radius:8px;color:var(--text)">
+<button class="red" type="submit">Block IP</button>
+</form>
+<p class="muted" style="margin:10px 0 0">Manual only. No automatic blocking or whitelist.</p>
+</section>
 <section class="panel"><div class="toolbar"><h2>Blocked IPs</h2></div><table><thead><tr><th>IP</th><th>Action</th></tr></thead><tbody>
 {% for ip in blocked %}<tr><td class="danger"><b>{{ip}}</b></td><td><form method="post" action="/unblock/{{ip}}" onsubmit="return confirm('Unblock {{ip}}?')"><button class="green">Unblock</button></form></td></tr>
 {% else %}<tr><td colspan="2" class="empty">No manually blocked IPs.</td></tr>{% endfor %}</tbody></table></section>
@@ -202,6 +209,13 @@ def index():
 def close(sid):
     if not require_auth(): return redirect(url_for("login"))
     try: close_session(sid)
+    except Exception: pass
+    return redirect(url_for("index"))
+
+@app.post("/block")
+def block_form():
+    if not require_auth(): return redirect(url_for("login"))
+    try: firewall_block(request.form.get("ip","").strip())
     except Exception: pass
     return redirect(url_for("index"))
 
