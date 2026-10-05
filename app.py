@@ -72,12 +72,18 @@ def ufw_del(action,ip,proto):
     r=cmd(rule);return r.returncode==0 or "Could not delete" in r.stdout+r.stderr
 
 def firewall_setup():
-    if os.geteuid()!=0 or not ufw_ok(): log.error("Guard requires working UFW and root privileges");return False
+    if os.geteuid()!=0 or not ufw_ok():
+        log.error("Guard requires working UFW and root privileges")
+        return False
     for p in ("tcp","udp"):
         cmd(["ufw","delete","allow",f"{PORT}/{p}"])
         r=cmd(["ufw","allow","log",f"{PORT}/{p}"])
-        if r.returncode:return False
-    cmd(["ufw","logging","medium"])
+        if r.returncode:
+            log.error("Failed to configure UFW logging rule for %s/%s",PORT,p)
+            return False
+    if cmd(["ufw","logging","medium"]).returncode:
+        log.error("Failed to enable UFW medium logging")
+        return False
     for x in store.white():
         for p in ("tcp","udp"):ufw_del("deny",x["ip"],p);ufw_del("allow",x["ip"],p);ufw("allow",x["ip"],p,True)
     for x in store.blocked():
@@ -170,9 +176,9 @@ def inspect_ip(ip):
     if not result:return
     usage=result["usage_type"].lower()
     datacenter="data center/web hosting/transit" in usage or "data center" in usage or "web hosting" in usage or usage=="hosting"
-    if result["score"]>ABUSE_THRESHOLD or datacenter:
+    if result["score"]>=ABUSE_THRESHOLD or datacenter:
         reason=[]
-        if result["score"]>ABUSE_THRESHOLD:reason.append(f"abuse score {result['score']}% > {ABUSE_THRESHOLD}%")
+        if result["score"]>=ABUSE_THRESHOLD:reason.append(f"abuse score {result['score']}% >= {ABUSE_THRESHOLD}%")
         if datacenter:reason.append(f"datacenter/hosting usage: {result['usage_type']}")
         details="; ".join(reason)+f"; reports={result['total_reports']}; isp={result['isp']}"
         ok,msg=block_ip(ip)
@@ -248,20 +254,21 @@ def worker():
         except Exception as e:STATUS={"online":0,"latency":None,"status":{},"error":str(e)}
         time.sleep(10)
 
-HTML="""<!doctype html><html><head><meta name=viewport content=\"width=device-width,initial-scale=1\"><title>Malachite Guard</title><style>body{font:14px sans-serif;background:#111;color:#eee;max-width:1200px;margin:auto;padding:20px}section{background:#222;padding:15px;margin:10px 0;border-radius:8px}input,button{padding:8px;margin:3px;background:#111;color:#eee;border:1px solid #555}table{width:100%}td,th{padding:7px;text-align:left;border-bottom:1px solid #444}pre{white-space:pre-wrap;max-height:350px;overflow:auto}</style></head><body><h1>Malachite Minecraft Guard</h1>
-{% if not authed %}<section><form method=post action=/login><input name=password type=password placeholder=\"Panel password\" required><button>Sign in</button></form></section>
+HTML="""<!doctype html><html><head><meta name=viewport content="width=device-width,initial-scale=1"><title>Malachite Guard</title><style>body{font:14px sans-serif;background:#111;color:#eee;max-width:1200px;margin:auto;padding:20px}section{background:#222;padding:15px;margin:10px 0;border-radius:8px}input,button{padding:8px;margin:3px;background:#111;color:#eee;border:1px solid #555}table{width:100%}td,th{padding:7px;text-align:left;border-bottom:1px solid #444}pre{white-space:pre-wrap;max-height:350px;overflow:auto}</style></head><body><h1>Malachite Minecraft Guard</h1>
+{% if not authed %}<section><form method=post action=/login><input name=password type=password placeholder="Panel password" required><button>Sign in</button></form></section>
 {% else %}<section><b>Backend:</b> {{backend}} | <b>Minecraft:</b> {{'ONLINE' if status.online else 'OFFLINE'}} | <b>Latency:</b> {{status.latency or status.error}} | <form method=post action=/logout><button>Log out</button></form></section>
-<section><b>Players:</b> {{status.status.get('players',{}).get('online',0)}} / {{status.status.get('players',{}).get('max','?')}}<br><b>Blocked:</b> {{blocked|length}} &nbsp; <b>Whitelisted:</b> {{white|length}}<br><b>AbuseIPDB:</b> {{'Enabled' if abuse_enabled else 'Disabled'}} | Auto-block: score &gt; {{abuse_threshold}}% or datacenter/hosting</section>
-<section><h2>Block / whitelist</h2><form method=post action=/block><input name=ip placeholder=IP required><input name=notes placeholder=reason><button>Block</button></form><form method=post action=/whitelist><input name=ip placeholder=IP required><input name=notes placeholder=notes><button>Whitelist</button></form></section>
-<section><h2>Connections</h2><table><tr><th>IP</th><th>Port</th><th>Destination</th><th>Action</th></tr>{% for x in conns %}<tr><td>{{x.ip}}</td><td>{{x.port}}</td><td>{{x.dst}}</td><td><form method=post action=\"/connection/{{x.session}}/close\"><button>Close</button></form><form method=post action=\"/block/{{x.ip}}\"><button>Block</button></form></td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table></section>
-<section><h2>Blacklist</h2><table>{% for x in blocked %}<tr><td>{{x.ip}}</td><td>{{x.source}}</td><td>{{x.notes}}</td><td><form method=post action=\"/unblock/{{x.ip}}\"><button>Remove</button></form></td></tr>{% else %}<tr><td>None</td></tr>{% endfor %}</table></section>
-<section><h2>Whitelist</h2><table>{% for x in white %}<tr><td>{{x.ip}}</td><td>{{x.notes}}</td><td><form method=post action=\"/unwhitelist/{{x.ip}}\"><button>Remove</button></form></td></tr>{% else %}<tr><td>None</td></tr>{% endfor %}</table></section>
-<section><h2>Web Logger</h2><pre>{% for x in events %}{{x.ts}} [{{x.level}}] {{x.event}}{% if x.ip %} {{x.ip}}{% endif %}{% if x.details %} | {{x.details}}{% endif %}\n{% endfor %}</pre></section>
-<section><h2>HAProxy log</h2><pre>{{hlog}}</pre></section><section><h2>Guard log</h2><pre>{{glog}}</pre></section>{% endif %}</body></html>"""
+<section><b>Players:</b> {{status.status.get('players',{}).get('online',0)}} / {{status.status.get('players',{}).get('max','?')}}<br><b>Blocked:</b> {{blocked|length}} &nbsp; <b>Whitelisted:</b> {{white|length}}<br><b>AbuseIPDB:</b> {{'Enabled' if abuse_enabled else 'Disabled'}} &nbsp; <b>Auto-block:</b> score &gt;= {{abuse_threshold}}% or datacenter/hosting</section>
+<section><h2>Block / whitelist</h2><form method=post action=/block><input name=ip placeholder=IP required><input name=notes placeholder=reason><button>Block</button></form>
+<form method=post action=/whitelist><input name=ip placeholder=IP required><input name=notes placeholder=notes><button>Whitelist</button></form></section>
+<section><h2>Connections</h2><table><tr><th>IP</th><th>Port</th><th>Destination</th><th>Action</th></tr>{% for x in conns %}<tr><td>{{x.ip}}</td><td>{{x.port}}</td><td>{{x.dst}}</td><td><form method=post action="/connection/{{x.session}}/close"><button>Close</button></form><form method=post action="/block/{{x.ip}}"><button>Block</button></form></td></tr>{% else %}<tr><td colspan=4>None</td></tr>{% endfor %}</table></section>
+<section><h2>Blacklist</h2><table>{% for x in blocked %}<tr><td>{{x.ip}}</td><td>{{x.source}}</td><td>{{x.notes}}</td><td><form method=post action="/unblock/{{x.ip}}"><button>Remove</button></form></td></tr>{% else %}<tr><td>None</td></tr>{% endfor %}</table></section>
+<section><h2>Whitelist</h2><table>{% for x in white %}<tr><td>{{x.ip}}</td><td>{{x.notes}}</td><td><form method=post action="/unwhitelist/{{x.ip}}"><button>Remove</button></form></td></tr>{% else %}<tr><td>None</td></tr>{% endfor %}</table></section>
+<section><h2>Web Logger</h2><table><tr><th>Time</th><th>Level</th><th>Event</th><th>IP</th><th>Details</th></tr>{% for x in events %}<tr><td>{{x.ts}}</td><td>{{x.level}}</td><td>{{x.event}}</td><td>{{x.ip}}</td><td>{{x.details}}</td></tr>{% else %}<tr><td colspan=5>None</td></tr>{% endfor %}</table></section>
+<section><h2>Logs</h2><pre>{{hlog}}</pre><pre>{{glog}}</pre></section>{% endif %}</body></html>"""
 def auth():return not PASSWORD or session.get("auth") is True
 def page():
     if not auth():return render_template_string(HTML,authed=False,error=None)
-    return render_template_string(HTML,authed=True,status=STATUS,backend=BACKEND,blocked=store.blocked(),white=store.white(),conns=sessions(),events=store.events(),hlog=tail(HLOG),glog=tail(GLOG),abuse_enabled=bool(ABUSEIPDB_KEY),abuse_threshold=ABUSE_THRESHOLD)
+    return render_template_string(HTML,authed=True,status=STATUS,backend=BACKEND,blocked=store.blocked(),white=store.white(),conns=sessions(),events=store.events(),abuse_enabled=bool(ABUSEIPDB_KEY),abuse_threshold=ABUSE_THRESHOLD,hlog=tail(HLOG),glog=tail(GLOG))
 @app.route("/login",methods=["GET","POST"])
 def login():
     if not PASSWORD:return redirect("/")
@@ -325,7 +332,11 @@ def close(sid):
     except Exception as e:return str(e),400
     store.event("INFO","SESSION_CLOSE",details=sid);return redirect("/")
 def main():
-    firewall_setup();threading.Thread(target=worker,daemon=True).start();threading.Thread(target=ufw_monitor,daemon=True).start()
-    log.info("Guard starting: backend=%s web=%s:%s firewall=ufw abuseipdb=%s",BACKEND,HOST,WEBPORT,bool(ABUSEIPDB_KEY))
+    if not firewall_setup():
+        log.critical("Firewall setup failed; refusing to start")
+        raise SystemExit(1)
+    threading.Thread(target=worker,daemon=True).start()
+    threading.Thread(target=ufw_monitor,daemon=True).start()
+    log.info("Guard starting: backend=%s web=%s:%s firewall=ufw",BACKEND,HOST,WEBPORT)
     app.run(host=HOST,port=WEBPORT,threaded=True,debug=False,use_reloader=False)
 if __name__=="__main__":main()
