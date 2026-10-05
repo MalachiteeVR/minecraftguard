@@ -23,8 +23,14 @@ local0.*    /var/log/haproxy.log
 & stop
 EOF
 
-touch /var/log/haproxy.log
-chmod 640 /var/log/haproxy.log
+# Keep UFW kernel firewall messages in a dedicated log for the Guard monitor.
+cat >/etc/rsyslog.d/48-minecraft-ufw.conf <<'EOF'
+:msg, contains, "UFW "    /var/log/ufw.log
+& stop
+EOF
+
+touch /var/log/haproxy.log /var/log/ufw.log
+chmod 640 /var/log/haproxy.log /var/log/ufw.log
 systemctl restart rsyslog
 haproxy -c -f /etc/haproxy/haproxy.cfg
 systemctl restart haproxy
@@ -32,11 +38,24 @@ systemctl restart haproxy
 # UFW replaces direct iptables management. Preserve SSH/Tailscale access before enabling it.
 ufw allow OpenSSH
 ufw allow from 100.64.0.0/10 to any port 2555 proto tcp
-ufw allow 25565/tcp
-ufw allow 25565/udp
+ufw logging medium
+ufw delete allow 25565/tcp || true
+ufw delete allow 25565/udp || true
+ufw allow log 25565/tcp
+ufw allow log 25565/udp
 ufw --force enable
 
 SECRET="$("$APP/venv/bin/python" -c 'import secrets; print(secrets.token_hex(32))')"
+
+ABUSE_KEY=""
+if systemctl cat minecraft-guard.service >/dev/null 2>&1; then
+    ABUSE_KEY="$(systemctl show minecraft-guard.service -p Environment --value 2>/dev/null | tr ' ' '\n' | sed -n 's/^ABUSEIPDB_API_KEY=//p' | head -n1 || true)"
+fi
+if [[ -z "$ABUSE_KEY" ]]; then
+    read -r -s -p "AbuseIPDB API key (leave blank to disable automatic reputation blocking): " ABUSE_KEY
+    echo
+fi
+
 cat >/etc/systemd/system/minecraft-guard.service <<EOF
 [Unit]
 Description=Malachite Minecraft Guard Linux Relay
@@ -54,6 +73,11 @@ Environment=PANEL_PASSWORD=CHANGE_ME
 Environment=PANEL_SECRET=$SECRET
 Environment=HAPROXY_SOCKET=/run/haproxy/admin.sock
 Environment=HA_LOG=/var/log/haproxy.log
+Environment=UFW_LOG=/var/log/ufw.log
+Environment=ABUSEIPDB_API_KEY=$ABUSE_KEY
+Environment=ABUSEIPDB_THRESHOLD=10
+Environment=ABUSEIPDB_MAX_AGE_DAYS=90
+Environment=ABUSEIPDB_CACHE_HOURS=24
 ExecStart=$APP/venv/bin/gunicorn --workers 1 --threads 8 --bind 0.0.0.0:2555 app:app
 Restart=always
 RestartSec=2
@@ -71,5 +95,7 @@ echo "Malachite Minecraft Guard installed on the Linux relay."
 echo "Panel: http://RELAY-IP:2555"
 echo "Backend: 100.87.154.87:25565"
 echo "Firewall: UFW"
+echo "UFW connection log: /var/log/ufw.log"
+echo "AbuseIPDB: score > 10% OR Data Center/Web Hosting/Transit => automatic block"
 echo "IMPORTANT: edit PANEL_PASSWORD in /etc/systemd/system/minecraft-guard.service"
 echo "Then run: systemctl daemon-reload && systemctl restart minecraft-guard"
