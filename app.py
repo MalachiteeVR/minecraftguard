@@ -8,7 +8,7 @@ import os
 import sqlite3
 import subprocess
 from pathlib import Path
-from flask import Flask, redirect, render_template_string, request, session, url_for
+from flask import Flask, Response, redirect, render_template_string, request, session, url_for
 
 BASE = Path(os.getenv("GUARD_DIR", "/opt/minecraft-guard"))
 DB = Path(os.getenv("GUARD_DB", str(BASE / "guard.db")))
@@ -77,7 +77,7 @@ def run_guard(action, ip):
 
 HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="5"><title>Malachite Minecraft Guard</title>
+<title>Malachite Minecraft Guard</title>
 <style>
 body{font-family:system-ui;background:#101114;color:#eee;margin:0;padding:20px}
 main{max-width:1250px;margin:auto}
@@ -89,7 +89,7 @@ th,td{padding:8px;border-bottom:1px solid #30333a;text-align:left}
 .actions{display:flex;gap:6px;flex-wrap:wrap}.muted{color:#999}.error{color:#ff8b8b}
 </style></head><body><main>
 <h1>Malachite Minecraft Guard</h1>
-<p class="muted">Linux relay panel. Guard log refreshes every 5 seconds.</p>
+<p class="muted">Linux relay panel. Guard log updates every 5 seconds.</p>
 {% if message %}<section><b>{{message}}</b></section>{% endif %}
 <section><h2>Manual IP Control</h2>
 <form method="post" action="/action" class="actions">
@@ -111,8 +111,25 @@ th,td{padding:8px;border-bottom:1px solid #30333a;text-align:left}
 <td><form method="post" action="/action"><input type="hidden" name="ip" value="{{x.ip}}"><button name="action" value="whitelist-remove">Remove</button></form></td></tr>
 {% else %}<tr><td colspan="4" class="muted">No whitelisted IPs.</td></tr>{% endfor %}
 </table></section>
-<section><h2>minecraft-guard.py Log</h2><div class="log">{{log}}</div></section>
-</main></body></html>"""
+<section><h2>minecraft-guard.py Log</h2><div id="guard-log" class="log">{{log}}</div></section>
+</main>
+<script>
+async function updateGuardLog() {
+    try {
+        const response = await fetch('/log', {cache: 'no-store'});
+        if (!response.ok) return;
+        const log = await response.text();
+        const box = document.getElementById('guard-log');
+        const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+        box.textContent = log;
+        if (wasAtBottom) box.scrollTop = box.scrollHeight;
+    } catch (error) {
+        console.error('Guard log update failed:', error);
+    }
+}
+setInterval(updateGuardLog, 5000);
+</script>
+</body></html>"""
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -144,6 +161,13 @@ def index():
         log=tail(),
         message=message,
     )
+
+
+@app.route("/log")
+def log_endpoint():
+    if not ok():
+        return Response("Unauthorized", status=401, mimetype="text/plain")
+    return Response(tail(), mimetype="text/plain")
 
 
 @app.route("/action", methods=["POST"])
