@@ -1,451 +1,244 @@
-import os
-import re
-import sys
-import time
-import json
-import sqlite3
-import argparse
-import subprocess
-import requests
-from pathlib import Path
+#!/usr/bin/env python3
+"""Malachite Minecraft Guard Linux relay daemon."""
+import ipaddress, logging, os, sqlite3, subprocess, sys, time
 from datetime import datetime, timezone
 
-# --- CONFIGURATION ---
-WORKDIR = Path(r"C:\Minecraft")
-ENV_FILE = WORKDIR / ".env"
-DB_FILE = WORKDIR / "blacklist.db"
-FIREWALL_LOG = Path(r"C:\Windows\System32\LogFiles\Firewall\pfirewall.log")
-MINECRAFT_BANNED_IPS_FILE = Path(r"C:\Minecraft\MCSS\servers\server54\banned-ips.json")
+BASE = os.getenv("GUARD_DIR", "/opt/minecraft-guard")
+DB = os.getenv("GUARD_DB", f"{BASE}/guard.db")
+LOG = os.getenv("GUARD_LOG", "/var/log/minecraft-guard.log")
+PORT = int(os.getenv("MINECRAFT_PUBLIC_PORT", "25565"))
+CHECK_INTERVAL = int(os.getenv("GUARD_INTERVAL", "5"))
 
-MINECRAFT_PORT = 25565
-SCAN_INTERVAL_SECONDS = 3
-ABUSE_SCORE_THRESHOLD = 10
-DATACENTER_USAGE_TYPE = "Data Center/Web Hosting/Transit"
+os.makedirs(BASE, exist_ok=True)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s", handlers=[logging.FileHandler(LOG), logging.StreamHandler()])
+log = logging.getLogger("minecraft-guard")
 
-def load_dotenv():
-    if not ENV_FILE.exists():
-        return
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def ip_ok(value):
     try:
-        content = ENV_FILE.read_text(encoding="utf-8-sig")
-        for line in content.splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            os.environ[k.strip()] = v.strip().strip('"\'')
-    except Exception as e:
-        print(f"[WARN] Failed to read .env file: {e}")
-
-class GuardDB:
-    def __init__(self, db_path):
-        self.db_path = db_path
-        self._init_db()
-
-    def _get_conn(self):
-        return sqlite3.connect(self.db_path)
-
-    def _init_db(self):
-        with self._get_conn() as conn:
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS blacklist (
-                    ip TEXT PRIMARY KEY,
-                    blocked_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    source TEXT NOT NULL,
-                    abuse_score INTEGER,
-                    usage_type TEXT,
-                    country_code TEXT,
-                    isp TEXT,
-                    domain TEXT,
-                    notes TEXT
-                )
-            """)
-            conn.execute("""
-                CREATE TABLE IF NOT EXISTS whitelist (
-                    ip TEXT PRIMARY KEY,
-                    added_at TEXT NOT NULL,
-                    notes TEXT
-                )
-            """)
-            conn.commit()
-
-    # --- Blacklist Operations ---
-    def is_blocked(self, ip):
-        with self._get_conn() as conn:
-            row = conn.execute("SELECT 1 FROM blacklist WHERE ip = ?", (ip,)).fetchone()
-            return row is not None
-
-    def add_blacklist_ip(self, ip, score=None, usage_type=None, country=None, isp=None, domain=None, notes=None):
-        now = datetime.now(timezone.utc).isoformat()
-        with self._get_conn() as conn:
-            conn.execute("""
-                INSERT INTO blacklist 
-                (ip, blocked_at, updated_at, source, abuse_score, usage_type, country_code, isp, domain, notes)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(ip) DO UPDATE SET
-                    updated_at=excluded.updated_at,
-                    abuse_score=excluded.abuse_score,
-                    usage_type=excluded.usage_type,
-                    notes=excluded.notes
-            """, (ip, now, now, "minecraft-guard/AbuseIPDB", score, usage_type, country, isp, domain, notes))
-            conn.commit()
-
-    def remove_blacklist_ip(self, ip):
-        with self._get_conn() as conn:
-            conn.execute("DELETE FROM blacklist WHERE ip = ?", (ip,))
-            conn.commit()
-
-    def get_all_blacklisted(self):
-        with self._get_conn() as conn:
-            return conn.execute("SELECT ip, blocked_at, abuse_score, usage_type, notes FROM blacklist").fetchall()
-
-    # --- Whitelist Operations ---
-    def is_whitelisted(self, ip):
-        with self._get_conn() as conn:
-            row = conn.execute("SELECT 1 FROM whitelist WHERE ip = ?", (ip,)).fetchone()
-            return row is not None
-
-    def add_whitelist_ip(self, ip, notes="Manual Whitelist"):
-        now = datetime.now(timezone.utc).isoformat()
-        with self._get_conn() as conn:
-            conn.execute("""
-                INSERT INTO whitelist (ip, added_at, notes)
-                VALUES (?, ?, ?)
-                ON CONFLICT(ip) DO UPDATE SET added_at=excluded.added_at, notes=excluded.notes
-            """, (ip, now, notes))
-            conn.commit()
-
-    def remove_whitelist_ip(self, ip):
-        with self._get_conn() as conn:
-            conn.execute("DELETE FROM whitelist WHERE ip = ?", (ip,))
-            conn.commit()
-
-    def get_all_whitelisted(self):
-        with self._get_conn() as conn:
-            return conn.execute("SELECT ip, added_at, notes FROM whitelist").fetchall()
-
-# --- MINECRAFT SERVER BANNED-IPS.JSON MANAGEMENT ---
-def add_ip_to_minecraft_banned_json(ip, reason="Auto-blocked by Minecraft Guard"):
-    if not MINECRAFT_BANNED_IPS_FILE.parent.exists():
-        return
-
-    banned_list = []
-    if MINECRAFT_BANNED_IPS_FILE.exists():
-        try:
-            content = MINECRAFT_BANNED_IPS_FILE.read_text(encoding="utf-8")
-            if content.strip():
-                banned_list = json.loads(content)
-        except Exception as e:
-            print(f"[WARN] Could not parse {MINECRAFT_BANNED_IPS_FILE}: {e}")
-
-    for entry in banned_list:
-        if isinstance(entry, dict) and entry.get("ip") == ip:
-            return  # Already in json
-
-    now_formatted = datetime.now().strftime("%Y-%m-%d %H:%M:%S %z")
-    new_entry = {
-        "ip": ip,
-        "created": now_formatted if now_formatted.endswith(('+', '-')) else f"{now_formatted} +0000",
-        "source": "MinecraftGuard",
-        "expires": "forever",
-        "reason": reason
-    }
-    banned_list.append(new_entry)
-
-    try:
-        MINECRAFT_BANNED_IPS_FILE.write_text(json.dumps(banned_list, indent=2), encoding="utf-8")
-        print(f"[MC-SERVER] Added {ip} to banned-ips.json")
-    except Exception as e:
-        print(f"[ERROR] Failed writing to banned-ips.json: {e}")
-
-def remove_ip_from_minecraft_banned_json(ip):
-    if not MINECRAFT_BANNED_IPS_FILE.exists():
-        return
-
-    try:
-        content = MINECRAFT_BANNED_IPS_FILE.read_text(encoding="utf-8")
-        if not content.strip():
-            return
-        banned_list = json.loads(content)
-    except Exception as e:
-        print(f"[WARN] Could not parse {MINECRAFT_BANNED_IPS_FILE}: {e}")
-        return
-
-    updated_list = [entry for entry in banned_list if isinstance(entry, dict) and entry.get("ip") != ip]
-
-    if len(updated_list) != len(banned_list):
-        try:
-            MINECRAFT_BANNED_IPS_FILE.write_text(json.dumps(updated_list, indent=2), encoding="utf-8")
-            print(f"[MC-SERVER] Removed {ip} from banned-ips.json")
-        except Exception as e:
-            print(f"[ERROR] Failed updating banned-ips.json: {e}")
-
-def is_public_ipv4(ip_str):
-    parts = ip_str.split('.')
-    if len(parts) != 4:
-        return False
-    try:
-        octets = [int(p) for p in parts]
+        return str(ipaddress.ip_address(value.strip()))
     except ValueError:
-        return False
+        raise ValueError("Invalid IP address")
 
-    o1, o2, _, _ = octets
-    if o1 == 10: return False
-    if o1 == 172 and 16 <= o2 <= 31: return False
-    if o1 == 192 and o2 == 168: return False
-    if o1 == 127: return False
-    if o1 == 100 and 64 <= o2 <= 127: return False  # Tailscale CGNAT
-    if o1 == 169 and o2 == 254: return False
-    if o1 >= 224: return False
+
+def cmd(args):
+    return subprocess.run(args, capture_output=True, text=True, timeout=10)
+
+
+class Store:
+    def __init__(self):
+        with self.conn() as c:
+            c.execute("CREATE TABLE IF NOT EXISTS blacklist(ip TEXT PRIMARY KEY,created TEXT,source TEXT,notes TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS whitelist(ip TEXT PRIMARY KEY,created TEXT,notes TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts TEXT,level TEXT,event TEXT,ip TEXT,details TEXT)")
+
+    def conn(self):
+        c = sqlite3.connect(DB, timeout=10)
+        c.row_factory = sqlite3.Row
+        return c
+
+    def blocked(self):
+        with self.conn() as c:
+            return [dict(x) for x in c.execute("SELECT * FROM blacklist ORDER BY created DESC")]
+
+    def white(self):
+        with self.conn() as c:
+            return [dict(x) for x in c.execute("SELECT * FROM whitelist ORDER BY created DESC")]
+
+    def iswhite(self, ip):
+        with self.conn() as c:
+            return c.execute("SELECT 1 FROM whitelist WHERE ip=?", (ip,)).fetchone() is not None
+
+    def isblocked(self, ip):
+        with self.conn() as c:
+            return c.execute("SELECT 1 FROM blacklist WHERE ip=?", (ip,)).fetchone() is not None
+
+    def block(self, ip, source="manual", notes=""):
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO blacklist VALUES(?,?,?,?)", (ip, now(), source, notes))
+
+    def unblock(self, ip):
+        with self.conn() as c:
+            c.execute("DELETE FROM blacklist WHERE ip=?", (ip,))
+
+    def addwhite(self, ip, notes=""):
+        with self.conn() as c:
+            c.execute("INSERT OR REPLACE INTO whitelist VALUES(?,?,?)", (ip, now(), notes))
+
+    def delwhite(self, ip):
+        with self.conn() as c:
+            c.execute("DELETE FROM whitelist WHERE ip=?", (ip,))
+
+    def event(self, level, event, ip="", details=""):
+        with self.conn() as c:
+            c.execute("INSERT INTO events(ts,level,event,ip,details) VALUES(?,?,?,?,?)", (now(), level, event, ip, details))
+
+store = Store()
+
+
+def ufw_ok():
+    return cmd(["ufw", "status"]).returncode == 0
+
+
+def ufw_rule(action, ip, proto, insert=False):
+    args = ["ufw"]
+    if insert:
+        args += ["insert", "1"]
+    args += [action, "from", ip, "to", "any", "port", str(PORT), "proto", proto]
+    r = cmd(args)
+    if r.returncode:
+        log.error("UFW %s %s/%s failed: %s", action, ip, proto, (r.stderr or r.stdout).strip())
+    return r.returncode == 0
+
+
+def ufw_delete(action, ip, proto):
+    r = cmd(["ufw", "delete", action, "from", ip, "to", "any", "port", str(PORT), "proto", proto])
+    return r.returncode == 0 or "Could not delete" in (r.stdout + r.stderr)
+
+
+def block_ip(ip, source="manual", notes=""):
+    ip = ip_ok(ip)
+    if store.iswhite(ip):
+        return False, "IP is whitelisted"
+    for proto in ("tcp", "udp"):
+        ufw_delete("allow", ip, proto)
+        ufw_delete("deny", ip, proto)
+        if not ufw_rule("deny", ip, proto, True):
+            return False, "UFW block failed"
+    store.block(ip, source, notes)
+    store.event("WARN", "BLOCK", ip, f"source={source} {notes}".strip())
+    log.warning("Blocked %s (%s)", ip, source)
+    return True, "blocked"
+
+
+def unblock_ip(ip):
+    ip = ip_ok(ip)
+    for proto in ("tcp", "udp"):
+        ufw_delete("deny", ip, proto)
+    store.unblock(ip)
+    store.event("INFO", "UNBLOCK", ip)
+    log.info("Unblocked %s", ip)
+    return True, "unblocked"
+
+
+def whitelist_add(ip, notes=""):
+    ip = ip_ok(ip)
+    for proto in ("tcp", "udp"):
+        ufw_delete("deny", ip, proto)
+        ufw_delete("allow", ip, proto)
+        if not ufw_rule("allow", ip, proto, True):
+            return False, "UFW whitelist failed"
+    store.addwhite(ip, notes)
+    store.unblock(ip)
+    store.event("INFO", "WHITELIST_ADD", ip, notes)
+    log.info("Whitelisted %s", ip)
+    return True, "whitelisted"
+
+
+def whitelist_remove(ip):
+    ip = ip_ok(ip)
+    for proto in ("tcp", "udp"):
+        ufw_delete("allow", ip, proto)
+    store.delwhite(ip)
+    store.event("INFO", "WHITELIST_REMOVE", ip)
+    log.info("Removed %s from whitelist", ip)
+    return True, "removed"
+
+
+def configure_firewall():
+    if os.geteuid() != 0 or not ufw_ok():
+        log.error("Guard requires root and working UFW")
+        return False
+    for proto in ("tcp", "udp"):
+        cmd(["ufw", "delete", "allow", f"{PORT}/{proto}"])
+        r = cmd(["ufw", "allow", "log", f"{PORT}/{proto}"])
+        if r.returncode:
+            log.error("Could not configure UFW logging for %s", proto)
+            return False
+    cmd(["ufw", "logging", "medium"])
+    for row in store.white():
+        whitelist_add(row["ip"], row.get("notes", ""))
+    for row in store.blocked():
+        if not store.iswhite(row["ip"]):
+            block_ip(row["ip"], row.get("source", "saved"), row.get("notes", ""))
     return True
 
-def get_ips_from_firewall_log(last_pos):
-    detected_ips = set()
-    if not FIREWALL_LOG.exists():
-        return detected_ips, last_pos
 
+def parse_ufw(line):
+    if f"DPT={PORT}" not in line or "UFW " not in line:
+        return None
+    parts = line.split()
+    src = next((x[4:] for x in parts if x.startswith("SRC=")), None)
+    proto = next((x[6:] for x in parts if x.startswith("PROTO=")), "?")
+    if not src:
+        return None
     try:
-        with open(FIREWALL_LOG, "r", encoding="utf-8", errors="ignore") as f:
-            f.seek(last_pos)
-            lines = f.readlines()
-            new_pos = f.tell()
-
-            for line in lines:
-                if line.startswith("#"):
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 8:
-                    src_ip = parts[4]
-                    dst_port = parts[7]
-
-                    if dst_port == str(MINECRAFT_PORT) and is_public_ipv4(src_ip):
-                        detected_ips.add(src_ip)
-
-            return detected_ips, new_pos
-    except Exception as e:
-        print(f"[WARN] Log parsing error: {e}")
-        return detected_ips, last_pos
-
-def get_remote_ipv4s_netstat():
-    ips = set()
-    try:
-        cmd = ["netstat", "-ano", "-p", "tcp"]
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        pattern = re.compile(rf'^\s*TCP\s+\S+:{MINECRAFT_PORT}\s+(\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}\.\d{{1,3}}):\d+\s+ESTABLISHED', re.MULTILINE)
-        for match in pattern.finditer(res.stdout):
-            ip = match.group(1)
-            if is_public_ipv4(ip):
-                ips.add(ip)
-    except Exception:
-        pass
-    return ips
-
-def block_ip_windows_firewall(ip):
-    rule_name = f"MinecraftGuard_Block_{ip}"
-    cmd = [
-        "powershell", "-Command",
-        f"if (-not (Get-NetFirewallRule -DisplayName '{rule_name}' -ErrorAction SilentlyContinue)) {{ "
-        f"New-NetFirewallRule -DisplayName '{rule_name}' -Direction Inbound -Action Block -RemoteAddress '{ip}' -Enabled True "
-        f"}}"
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(f"[FIREWALL] Blocked {ip} in Windows Firewall.")
-    except Exception as e:
-        print(f"[ERROR] Failed to add firewall rule for {ip}: {e}")
-
-def unblock_ip_windows_firewall(ip):
-    rule_name = f"MinecraftGuard_Block_{ip}"
-    cmd = [
-        "powershell", "-Command",
-        f"Remove-NetFirewallRule -DisplayName '{rule_name}' -ErrorAction SilentlyContinue"
-    ]
-    try:
-        subprocess.run(cmd, capture_output=True, text=True, check=True)
-        print(f"[FIREWALL] Removed rule for {ip} from Windows Firewall.")
-    except Exception as e:
-        print(f"[ERROR] Failed to remove firewall rule for {ip}: {e}")
-
-def check_abuseipdb(ip, api_key):
-    url = "https://api.abuseipdb.com/api/v2/check"
-    headers = {"Key": api_key, "Accept": "application/json"}
-    params = {"ipAddress": ip, "maxAgeInDays": "90", "verbose": ""}
-    try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        if resp.status_code == 200:
-            return resp.json().get("data", {})
-        else:
-            return None
-    except Exception:
+        return ip_ok(src), proto
+    except ValueError:
         return None
 
-def send_discord_webhook(webhook_url, title, color, fields):
-    if not webhook_url:
-        return
-    payload = {
-        "embeds": [{
-            "title": title,
-            "color": color,
-            "fields": fields,
-            "timestamp": datetime.now(timezone.utc).isoformat()
-        }]
-    }
-    try:
-        requests.post(webhook_url, json=payload, timeout=5)
-    except Exception:
-        pass
 
-def process_ip(ip, api_key, db, webhook_url):
-    if db.is_whitelisted(ip):
-        print(f"[WHITELIST] {ip} is whitelisted. Skipping checks.")
-        return
+def monitor():
+    path = os.getenv("UFW_LOG", "/var/log/ufw.log")
+    pos = os.path.getsize(path) if os.path.exists(path) else 0
+    while True:
+        try:
+            if not os.path.exists(path):
+                time.sleep(CHECK_INTERVAL)
+                continue
+            size = os.path.getsize(path)
+            if size < pos:
+                pos = 0
+            with open(path, "r", errors="replace") as f:
+                f.seek(pos)
+                for line in f:
+                    pos = f.tell()
+                    parsed = parse_ufw(line)
+                    if not parsed:
+                        continue
+                    ip, proto = parsed
+                    store.event("INFO", "CONNECTION", ip, f"port={PORT} proto={proto}")
+                    log.info("Connection from %s to port %s/%s", ip, PORT, proto)
+        except Exception as exc:
+            log.error("Monitor error: %s", exc)
+        time.sleep(CHECK_INTERVAL)
 
-    if db.is_blocked(ip):
-        return
-
-    print(f"[DETECTED PROBE/SCAN] {ip} -> Checking AbuseIPDB...")
-    data = check_abuseipdb(ip, api_key)
-
-    if not data:
-        print(f"[WARN] Could not check {ip}.")
-        return
-
-    score = data.get("abuseConfidenceScore", 0)
-    usage = data.get("usageType", "Unknown")
-    country = data.get("countryCode", "Unknown")
-    isp = data.get("isp", "Unknown")
-    domain = data.get("domain", "N/A")
-
-    should_block = False
-    reasons = []
-
-    if score >= ABUSE_SCORE_THRESHOLD:
-        should_block = True
-        reasons.append(f"Abuse score {score}% >= threshold {ABUSE_SCORE_THRESHOLD}%")
-
-    if usage == DATACENTER_USAGE_TYPE:
-        should_block = True
-        reasons.append(f"Usage type '{usage}' matched policy")
-
-    fields = [
-        {"name": "IP Address", "value": ip, "inline": True},
-        {"name": "Country", "value": country, "inline": True},
-        {"name": "Abuse Score", "value": f"{score}%", "inline": True},
-        {"name": "Usage Type", "value": usage, "inline": True},
-        {"name": "ISP", "value": isp, "inline": True},
-        {"name": "Domain", "value": domain, "inline": True}
-    ]
-
-    if should_block:
-        reason_str = "; ".join(reasons)
-        print(f"[ACTION] Blocking {ip}: {reason_str}")
-        block_ip_windows_firewall(ip)
-        add_ip_to_minecraft_banned_json(ip, reason=reason_str)
-        db.add_blacklist_ip(ip, score=score, usage_type=usage, country=country, isp=isp, domain=domain, notes=reason_str)
-        fields.append({"name": "Action", "value": f"Blocked ({reason_str})", "inline": False})
-        send_discord_webhook(webhook_url, f"🚨 Scanner/IP Blocked: {ip}", 0xE74C3C, fields)
-    else:
-        print(f"[ACTION] Allowed connection/scan from {ip}")
-        fields.append({"name": "Action", "value": "Allowed Connection", "inline": False})
-        send_discord_webhook(webhook_url, f"✅ Connection Allowed: {ip}", 0x2ECC71, fields)
 
 def main():
-    parser = argparse.ArgumentParser(description="Minecraft Guard CLI & Monitoring Daemon")
-    parser.add_argument("--list", action="store_true", help="List all currently blocked IPs")
-    parser.add_argument("--block", type=str, metavar="IP", help="Manually block an IP address")
-    parser.add_argument("--unblock", type=str, metavar="IP", help="Manually unblock an IP address")
-    parser.add_argument("--whitelist-add", type=str, metavar="IP", help="Add an IP address to the whitelist")
-    parser.add_argument("--whitelist-remove", type=str, metavar="IP", help="Remove an IP address from the whitelist")
-    parser.add_argument("--whitelist-list", action="store_true", help="List all whitelisted IPs")
-    
-    args = parser.parse_args()
-    db = GuardDB(DB_FILE)
-
-    # --- CLI COMMAND EXECUTION ---
-    if args.list:
-        rows = db.get_all_blacklisted()
-        print(f"\n--- Currently Blocked IPs ({len(rows)}) ---")
-        for r in rows:
-            print(f"IP: {r[0]} | Blocked: {r[1]} | Score: {r[2]}% | Usage: {r[3]} | Reason: {r[4]}")
-        return
-
-    if args.whitelist_list:
-        rows = db.get_all_whitelisted()
-        print(f"\n--- Whitelisted IPs ({len(rows)}) ---")
-        for r in rows:
-            print(f"IP: {r[0]} | Added: {r[1]} | Notes: {r[2]}")
-        return
-
-    if args.block:
-        ip = args.block
-        print(f"Manually blocking {ip}...")
-        block_ip_windows_firewall(ip)
-        add_ip_to_minecraft_banned_json(ip, reason="Manual CLI block")
-        db.add_blacklist_ip(ip, notes="Manual CLI block")
-        print(f"Successfully blocked {ip}.")
-        return
-
-    if args.unblock:
-        ip = args.unblock
-        print(f"Unblocking {ip}...")
-        unblock_ip_windows_firewall(ip)
-        remove_ip_from_minecraft_banned_json(ip)
-        db.remove_blacklist_ip(ip)
-        print(f"Successfully unblocked {ip}.")
-        return
-
-    if args.whitelist_add:
-        ip = args.whitelist_add
-        print(f"Adding {ip} to whitelist...")
-        db.add_whitelist_ip(ip)
-        if db.is_blocked(ip):
-            unblock_ip_windows_firewall(ip)
-            remove_ip_from_minecraft_banned_json(ip)
-            db.remove_blacklist_ip(ip)
-            print(f"Removed existing block rule for whitelisted IP {ip}.")
-        print(f"Successfully whitelisted {ip}.")
-        return
-
-    if args.whitelist_remove:
-        ip = args.whitelist_remove
-        print(f"Removing {ip} from whitelist...")
-        db.remove_whitelist_ip(ip)
-        print(f"Successfully removed {ip} from whitelist.")
-        return
-
-    # --- DAEMON MONITORING LOOP ---
-    load_dotenv()
-    api_key = os.getenv("ABUSEIPDB_API_KEY")
-    webhook_url = os.getenv("DISCORD_WEBHOOK_URL")
-
-    print("=" * 68)
-    print(" Minecraft Guard - Full Scan Detector (WFP Log + Netstat)")
-    print("=" * 68)
-    print(f"Monitoring log: {FIREWALL_LOG}")
-    print(f"Minecraft Port: {MINECRAFT_PORT}")
-    print(f"MC Server Banlist: {MINECRAFT_BANNED_IPS_FILE}")
-
-    if not api_key:
-        print("[ERROR] ABUSEIPDB_API_KEY is missing.")
-        sys.exit(1)
-
-    seen_ips = set()
-    log_pos = FIREWALL_LOG.stat().st_size if FIREWALL_LOG.exists() else 0
-
-    try:
-        while True:
-            fw_ips, log_pos = get_ips_from_firewall_log(log_pos)
-            netstat_ips = get_remote_ipv4s_netstat()
-            all_detected = fw_ips.union(netstat_ips)
-
-            for ip in sorted(all_detected):
-                if ip not in seen_ips:
-                    seen_ips.add(ip)
-                    process_ip(ip, api_key, db, webhook_url)
-
-            time.sleep(SCAN_INTERVAL_SECONDS)
-    except KeyboardInterrupt:
-        print("\n[STOP] Guard stopped.")
+    if len(sys.argv) > 1:
+        action = sys.argv[1]
+        if action in ("--block", "--unblock", "--whitelist-add", "--whitelist-remove") and len(sys.argv) < 3:
+            print("IP address required", file=sys.stderr)
+            return 2
+        try:
+            if action == "--block": ok, msg = block_ip(sys.argv[2])
+            elif action == "--unblock": ok, msg = unblock_ip(sys.argv[2])
+            elif action == "--whitelist-add": ok, msg = whitelist_add(sys.argv[2])
+            elif action == "--whitelist-remove": ok, msg = whitelist_remove(sys.argv[2])
+            elif action == "--list":
+                print("Blacklist:")
+                for row in store.blocked(): print(row["ip"], row["source"], row["notes"])
+                return 0
+            elif action == "--whitelist-list":
+                print("Whitelist:")
+                for row in store.white(): print(row["ip"], row["notes"])
+                return 0
+            else:
+                print("Usage: minecraft-guard.py [--block IP|--unblock IP|--whitelist-add IP|--whitelist-remove IP|--list|--whitelist-list]")
+                return 2
+            print(msg)
+            return 0 if ok else 1
+        except Exception as exc:
+            print(str(exc), file=sys.stderr)
+            return 1
+    if not configure_firewall():
+        return 1
+    log.info("Malachite Minecraft Guard started; checking UFW every %ss", CHECK_INTERVAL)
+    monitor()
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
