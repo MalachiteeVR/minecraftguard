@@ -28,6 +28,7 @@ ABUSE_THRESHOLD = int(os.getenv("ABUSEIPDB_THRESHOLD", "90"))
 ABUSE_MAX_AGE_DAYS = int(os.getenv("ABUSEIPDB_MAX_AGE_DAYS", "90"))
 ABUSE_CACHE_SECONDS = int(os.getenv("ABUSEIPDB_CACHE_SECONDS", "86400"))
 ABUSE_TIMEOUT = int(os.getenv("ABUSEIPDB_TIMEOUT", "10"))
+BLOCK_DATACENTERS = os.getenv("BLOCK_DATACENTERS", "true").strip().lower() in ("1", "true", "yes", "on")
 
 os.makedirs(BASE, exist_ok=True)
 logging.basicConfig(
@@ -68,20 +69,21 @@ def cmd(args):
 class Store:
     def __init__(self):
         with self.conn() as c:
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS blacklist(ip TEXT PRIMARY KEY,created TEXT,source TEXT,notes TEXT)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS whitelist(ip TEXT PRIMARY KEY,created TEXT,notes TEXT)"
-            )
-            c.execute(
-                "CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts TEXT,level TEXT,event TEXT,ip TEXT,details TEXT)"
-            )
-            c.execute(
-                """CREATE TABLE IF NOT EXISTS abuse_cache(
-                    ip TEXT PRIMARY KEY, checked REAL NOT NULL, confidence INTEGER NOT NULL,
-                    reports INTEGER NOT NULL, details TEXT)"""
-            )
+            c.execute("CREATE TABLE IF NOT EXISTS blacklist(ip TEXT PRIMARY KEY,created TEXT,source TEXT,notes TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS whitelist(ip TEXT PRIMARY KEY,created TEXT,notes TEXT)")
+            c.execute("CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,ts TEXT,level TEXT,event TEXT,ip TEXT,details TEXT)")
+            c.execute("""CREATE TABLE IF NOT EXISTS abuse_cache(
+                ip TEXT PRIMARY KEY, checked REAL NOT NULL, confidence INTEGER NOT NULL,
+                reports INTEGER NOT NULL, usage_type TEXT, isp TEXT, domain TEXT, details TEXT)""")
+            # Migrate an existing Guard database created before hosting metadata was stored.
+            columns = {row[1] for row in c.execute("PRAGMA table_info(abuse_cache)")}
+            for name, definition in (
+                ("usage_type", "TEXT"),
+                ("isp", "TEXT"),
+                ("domain", "TEXT"),
+            ):
+                if name not in columns:
+                    c.execute(f"ALTER TABLE abuse_cache ADD COLUMN {name} {definition}")
 
     def conn(self):
         c = sqlite3.connect(DB, timeout=10)
@@ -122,23 +124,18 @@ class Store:
 
     def event(self, level, event, ip="", details=""):
         with self.conn() as c:
-            c.execute(
-                "INSERT INTO events(ts,level,event,ip,details) VALUES(?,?,?,?,?)",
-                (now(), level, event, ip, details),
-            )
+            c.execute("INSERT INTO events(ts,level,event,ip,details) VALUES(?,?,?,?,?)", (now(), level, event, ip, details))
 
     def abuse_get(self, ip):
         with self.conn() as c:
             row = c.execute("SELECT * FROM abuse_cache WHERE ip=?", (ip,)).fetchone()
             return dict(row) if row else None
 
-    def abuse_put(self, ip, confidence, reports, details):
+    def abuse_put(self, ip, confidence, reports, usage_type, isp, domain, details):
         with self.conn() as c:
-            c.execute(
-                """INSERT OR REPLACE INTO abuse_cache
-                   (ip,checked,confidence,reports,details) VALUES(?,?,?,?,?)""",
-                (ip, time.time(), confidence, reports, details),
-            )
+            c.execute("""INSERT OR REPLACE INTO abuse_cache
+                (ip,checked,confidence,reports,usage_type,isp,domain,details)
+                VALUES(?,?,?,?,?,?,?,?)""", (ip, time.time(), confidence, reports, usage_type, isp, domain, details))
 
 
 store = Store()
@@ -160,21 +157,7 @@ def ufw_rule(action, ip, proto, insert=False):
 
 
 def ufw_delete(action, ip, proto):
-    r = cmd(
-        [
-            "ufw",
-            "delete",
-            action,
-            "from",
-            ip,
-            "to",
-            "any",
-            "port",
-            str(PUBLIC_PORT),
-            "proto",
-            proto,
-        ]
-    )
+    r = cmd(["ufw", "delete", action, "from", ip, "to", "any", "port", str(PUBLIC_PORT), "proto", proto])
     return r.returncode == 0 or "Could not delete" in (r.stdout + r.stderr)
 
 
@@ -239,13 +222,8 @@ def abuse_check(ip):
 
     cached = store.abuse_get(ip)
     if cached and time.time() - cached["checked"] < ABUSE_CACHE_SECONDS:
-        log.info(
-            "AbuseIPDB cache: %s%% confidence, %s reports for %s",
-            cached["confidence"],
-            cached["reports"],
-            ip,
-        )
-        return cached["confidence"], cached["reports"]
+        log.info("AbuseIPDB cache: %s%% confidence, %s reports, usage=%s, isp=%s for %s", cached["confidence"], cached["reports"], cached.get("usage_type") or "unknown", cached.get("isp") or "unknown", ip)
+        return cached["confidence"], cached["reports"], cached.get("usage_type") or "", cached.get("isp") or "", cached.get("domain") or ""
 
     try:
         response = requests.get(
@@ -258,12 +236,50 @@ def abuse_check(ip):
         data = response.json().get("data", {})
         confidence = int(data.get("abuseConfidenceScore", 0))
         reports = int(data.get("totalReports", 0))
-        store.abuse_put(ip, confidence, reports, str(data))
-        log.info("AbuseIPDB: %s%% confidence, %s reports", confidence, reports)
-        return confidence, reports
+        usage_type = str(data.get("usageType") or "")
+        isp = str(data.get("isp") or "")
+        domain = str(data.get("domain") or "")
+        store.abuse_put(ip, confidence, reports, usage_type, isp, domain, str(data))
+        log.info("AbuseIPDB: %s%% confidence, %s reports, usage=%s, isp=%s", confidence, reports, usage_type or "unknown", isp or "unknown")
+        return confidence, reports, usage_type, isp, domain
     except Exception as exc:
         log.error("AbuseIPDB lookup failed for %s: %s", ip, exc)
         return None
+
+
+def is_datacenter(usage_type, isp="", domain=""):
+    """Return True for AbuseIPDB address space classified as hosting/datacenter.
+
+    AbuseIPDB's check endpoint exposes usageType values such as
+    'Data Center/Web Hosting/Transit'. We intentionally use that structured
+    field first, with a conservative provider-name fallback for records whose
+    usageType is blank.
+    """
+    normalized = (usage_type or "").strip().lower()
+    if normalized in {
+        "data center/web hosting/transit",
+        "data center",
+        "web hosting",
+        "hosting",
+        "transit",
+    }:
+        return True
+
+    # Only use provider-name hints when AbuseIPDB did not provide a usage type.
+    # This avoids blocking ordinary ISPs merely because their names contain a
+    # generic word such as 'network' or 'communications'.
+    if normalized:
+        return False
+
+    provider = f"{isp} {domain}".lower()
+    hosting_markers = (
+        "amazon web services", "amazon.com", "aws", "microsoft azure",
+        "azure", "google cloud", "google llc", "digitalocean", "digital ocean",
+        "linode", "akamai", "vultr", "hetzner", "ovh", "oracle cloud",
+        "contabo", "choopa", "rackspace", "leaseweb", "hostwinds",
+        "scaleway", "upcloud", "ionos", "hostinger", "cloudsigma",
+    )
+    return any(marker in provider for marker in hosting_markers)
 
 
 def inspect_ip(ip):
@@ -283,7 +299,16 @@ def inspect_ip(ip):
         # Do not turn an AbuseIPDB outage into a Minecraft outage.
         return True
 
-    confidence, reports = result
+    confidence, reports, usage_type, isp, domain = result
+
+    if BLOCK_DATACENTERS and is_datacenter(usage_type, isp, domain):
+        notes = f"AbuseIPDB usageType={usage_type or 'unknown'}, ISP={isp or 'unknown'}, domain={domain or 'unknown'}"
+        ok, _ = block_ip(ip, source="datacenter", notes=notes)
+        if ok:
+            log.warning("Automatically blocked datacenter/hosting IP %s: %s", ip, notes)
+            store.event("WARN", "AUTO_BLOCK_DATACENTER", ip, notes)
+        return False
+
     if confidence >= ABUSE_THRESHOLD:
         notes = f"AbuseIPDB: {confidence}% confidence, {reports} reports; threshold={ABUSE_THRESHOLD}%"
         ok, _ = block_ip(ip, source="abuseipdb", notes=notes)
@@ -292,7 +317,7 @@ def inspect_ip(ip):
             store.event("WARN", "AUTO_BLOCK", ip, notes)
         return False
 
-    log.info("Allowed %s: AbuseIPDB %s%% confidence, %s reports", ip, confidence, reports)
+    log.info("Allowed %s: AbuseIPDB %s%% confidence, %s reports, usage=%s, isp=%s", ip, confidence, reports, usage_type or "unknown", isp or "unknown")
     return True
 
 
@@ -301,8 +326,6 @@ def configure_firewall():
         log.error("Guard requires root and working UFW")
         return False
 
-    # Guard itself owns the public TCP port. HAProxy is moved to loopback:25566.
-    # Remove the old public UDP rule because UDP is intentionally not proxied.
     cmd(["ufw", "delete", "allow", f"{PUBLIC_PORT}/udp"])
     cmd(["ufw", "allow", f"{PUBLIC_PORT}/tcp"])
     cmd(["ufw", "logging", "medium"])
@@ -373,13 +396,7 @@ def run_proxy():
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.bind((PUBLIC_HOST, PUBLIC_PORT))
         server.listen(BACKLOG)
-        log.info(
-            "Guard TCP pre-filter listening on %s:%s; HAProxy upstream %s:%s",
-            PUBLIC_HOST,
-            PUBLIC_PORT,
-            HAPROXY_HOST,
-            HAPROXY_PORT,
-        )
+        log.info("Guard TCP pre-filter listening on %s:%s; HAProxy upstream %s:%s", PUBLIC_HOST, PUBLIC_PORT, HAPROXY_HOST, HAPROXY_PORT)
         while True:
             client, address = server.accept()
             threading.Thread(target=handle_client, args=(client, address), daemon=True).start()
@@ -417,12 +434,7 @@ def main():
         return 1
 
     if ABUSE_API_KEY:
-        log.info(
-            "AbuseIPDB enabled; threshold=%s%%, maxAge=%sd, cache=%ss",
-            ABUSE_THRESHOLD,
-            ABUSE_MAX_AGE_DAYS,
-            ABUSE_CACHE_SECONDS,
-        )
+        log.info("AbuseIPDB enabled; threshold=%s%%, maxAge=%sd, cache=%ss, block_datacenters=%s", ABUSE_THRESHOLD, ABUSE_MAX_AGE_DAYS, ABUSE_CACHE_SECONDS, BLOCK_DATACENTERS)
     else:
         log.warning("AbuseIPDB disabled: ABUSEIPDB_API_KEY is not configured")
 
